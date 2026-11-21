@@ -1273,9 +1273,10 @@ NSData *nvmtl_compile_library_entry(NSData *air, NSString *ll, NSString *stage, 
 // shader on the thread that asks. It does the work the application's own request would do, through the same
 // single-flight entry (nvmtl_compile_library_entry), so a shader is translated once whoever asks first. Only the plain
 // translation is made here: variants that depend on function-constant values, and functions that need linking at pipeline
-// creation, are left to the pipeline path. NVMTL_PRETRANSLATE=0 or unset: nothing runs. NVMTL_PRETRANSLATE_THREADS (1..4, 2).
+// creation, are left to the pipeline path. NVMTL_PRETRANSLATE_THREADS controls the plain worker count (1..4, default 2).
 typedef struct { void *lib; void *name; } nvmtl_pre_job;
 static _Atomic unsigned long gPreQueued, gPreDone, gPreTranslated, gPreCached, gPreSkipped, gPreFailed;
+static void nvmtl_fcwarm_library(NSDictionary<NSString *, NSString *> *airs);
 static nvmtl_pool *nvmtl_pre_pool(void) {
     static nvmtl_pool pool; static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -1309,8 +1310,11 @@ static void nvmtl_pre_run(void *ctx) {
               (unsigned long)atomic_load(&gPreCached), (unsigned long)atomic_load(&gPreSkipped), (unsigned long)atomic_load(&gPreFailed));
 }
 void nvmtl_pretranslate_library(NVMTLLibrary *lib) {
+    if (!lib || !lib->_fns.count || !lib->_airs) return;
+    const char *process = getprogname();
+    if (process && !strcmp(process, "WindowServer")) nvmtl_fcwarm_library(lib->_airs);
     const char *on = getenv("NVMTL_PRETRANSLATE");
-    if (!on || strcmp(on, "1") || !lib || !lib->_fns.count || !lib->_airs || !nvmtl_xlate_ready()) return;
+    if (!on || strcmp(on, "1") || !nvmtl_xlate_ready()) return;
     unsigned long n = 0;
     for (NSString *name in lib->_fns) {
         nvmtl_pre_job *j = malloc(sizeof *j); if (!j) break;
@@ -1756,17 +1760,17 @@ NSData *nvmtl_translate_with_fc(NSString *ll, NSString *stage, const uint32_t *i
  * WindowServer's watchdog killed it (bug_type 409, at the login window after a driver update) while its main thread
  * translated Core Animation's fixed_frag variants one after another, 1.3-2 s each: the update's new translator build
  * swept every cached variant, and the main thread asked for dozens. A set that took long is recorded beside the cache
- * (.fcwarm.v1: the AIR text's digest and the exact key bytes), and the first time a process asks for any variant of
- * that AIR text, every other recorded variant whose cache file is missing is translated on background threads into the
- * same cache files. The main thread then reads a file, or waits for the translation already running for it, instead
- * of starting its own. Entries are written by the same code with the same key bytes (recorded verbatim) and the same
- * translator, so a warmed file is the file a live miss would have written. NVMTL_FCWARM_OFF=1 turns it off. */
+ * (.fcwarm.v1: the AIR text's digest and the exact key bytes). WindowServer starts replay when it loads the library;
+ * the first specialization of that AIR text also starts replay if the library scan has not reached it yet. Demand can
+ * take a queued variant immediately and joins only work that is already running. Replay uses the same cache keys and
+ * translator as demand. NVMTL_FCWARM_OFF=1 turns it off. */
 #define NVMTL_FCWARM_RECORD_MS 100      // chosen: a cached variant costs < 5 ms; the uber-shader variants cost 300-2000
 #define NVMTL_FCWARM_MAX_RECORDS 1024   // chosen: WindowServer held 67 such variants; bounds the file at ~1 MB
 #define NVMTL_FCWARM_JOIN_SEC 60        // chosen: longer than any measured translation (3.2 s), shorter than a hang
 static int nvmtl_fcwarm_on(void) {
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_FCWARM_OFF"); on = (e && *e && *e != '0') ? 0 : 1; }
+    static int on;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ const char *e = getenv("NVMTL_FCWARM_OFF"); on = !e || !*e || *e == '0'; });
     return on;
 }
 static NSString *nvmtl_fcwarm_records_path(void) {
@@ -1785,10 +1789,10 @@ static NSString *nvmtl_fcwarm_air_hex(NVMTLAirDigest *ad) {
 static os_unfair_lock gFcWarmLock = OS_UNFAIR_LOCK_INIT;
 static NSMutableSet<NSString *> *gFcWarmRecorded;          // "<airhex> <base64 key>" lines in the file
 static NSMutableSet<NSString *> *gFcWarmKicked;            // AIR digests this process has warmed
-static NSMutableDictionary<NSString *, dispatch_group_t> *gFcWarmInFlight;   // cache path -> its background translation
+static NSMutableDictionary<NSString *, dispatch_group_t> *gFcWarmInFlight;   // cache path -> its active translation
 static void nvmtl_fcwarm_load_locked(NSString *file) {
     if (gFcWarmRecorded) return;
-    gFcWarmRecorded = [NSMutableSet set]; gFcWarmKicked = [NSMutableSet set]; gFcWarmInFlight = [NSMutableDictionary dictionary];
+    gFcWarmRecorded = [NSMutableSet set]; gFcWarmKicked = [NSMutableSet set];
     NSString *text = file ? [NSString stringWithContentsOfFile:file encoding:NSUTF8StringEncoding error:NULL] : nil;
     for (NSString *line in [text componentsSeparatedByString:@"\n"])
         if (line.length > 65 && [line characterAtIndex:64] == ' ' && gFcWarmRecorded.count < NVMTL_FCWARM_MAX_RECORDS)
@@ -1838,19 +1842,37 @@ static BOOL nvmtl_fcwarm_unpack(NSData *key, NSString **stage, NSMutableData **p
     *stage = st; *packed = m; *n = k;
     return YES;
 }
-static dispatch_queue_t nvmtl_fcwarm_queue(void) {
-    static dispatch_queue_t q; static dispatch_once_t once;
-    dispatch_once(&once, ^{ q = dispatch_queue_create("nvmtl.fc-warm", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_UTILITY, 0)); });
+static NSOperationQueue *nvmtl_fcwarm_queue(void) {
+    static NSOperationQueue *q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = [NSOperationQueue new];
+        q.name = @"nvmtl.fc-warm";
+        q.qualityOfService = NSQualityOfServiceUtility;
+        q.maxConcurrentOperationCount = 2;   // an uber-shader translation can use hundreds of MB
+    });
     return q;
 }
-static dispatch_semaphore_t nvmtl_fcwarm_slots(void) {
-    // two at a time: each translation of an uber-shader holds a few hundred MB, and WindowServer keeps the other cores
-    static dispatch_semaphore_t s; static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = dispatch_semaphore_create(2); });
-    return s;
+static dispatch_group_t nvmtl_fcwarm_claim(NSString *path, dispatch_group_t *pending) {
+    os_unfair_lock_lock(&gFcWarmLock);
+    if (!gFcWarmInFlight) gFcWarmInFlight = [NSMutableDictionary new];
+    dispatch_group_t active = gFcWarmInFlight[path], owner = nil;
+    if (!active) {
+        owner = dispatch_group_create();
+        dispatch_group_enter(owner);   // publish only after a waiter can observe outstanding work
+        gFcWarmInFlight[path] = owner;
+    }
+    os_unfair_lock_unlock(&gFcWarmLock);
+    if (pending) *pending = active;
+    return owner;
 }
-// First variant of this AIR text in this process: translate every recorded sibling whose cache file is missing. The
-// caller's own set (mine) is left to the caller, which translates it at once instead of queueing behind the others.
+static void nvmtl_fcwarm_release(NSString *path, dispatch_group_t owner) {
+    os_unfair_lock_lock(&gFcWarmLock);
+    [gFcWarmInFlight removeObjectForKey:path];
+    os_unfair_lock_unlock(&gFcWarmLock);
+    dispatch_group_leave(owner);
+}
+// Replay missing variants of this exact AIR digest once. When kicked by demand, that caller owns its own miss.
 static void nvmtl_fcwarm_kick(NSString *ll, NVMTLAirDigest *ad, NSString *mine) {
     NSString *file = nvmtl_fcwarm_records_path();
     if (!file || !ad || !nvmtl_fcwarm_on()) return;
@@ -1873,43 +1895,62 @@ static void nvmtl_fcwarm_kick(NSString *ll, NVMTLAirDigest *ad, NSString *mine) 
     for (NSData *key in keys) {
         NSString *path = nvmtl_spvcache_path_air(ad, key, @"fc1");
         if (!path || [path isEqualToString:mine] || [[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
-        NSString *stage = nil; NSMutableData *packed = nil; size_t n = 0;
-        if (!nvmtl_fcwarm_unpack(key, &stage, &packed, &n)) continue;
-        dispatch_group_t g = dispatch_group_create();
-        os_unfair_lock_lock(&gFcWarmLock);
-        const BOOL taken = gFcWarmInFlight[path] != nil;
-        if (!taken) gFcWarmInFlight[path] = g;
-        os_unfair_lock_unlock(&gFcWarmLock);
-        if (taken) continue;
         queued++;
-        dispatch_group_async(g, nvmtl_fcwarm_queue(), ^{
-            dispatch_semaphore_wait(nvmtl_fcwarm_slots(), DISPATCH_TIME_FOREVER);
-            const uint32_t *idx = packed.bytes, *sz = idx + n;
-            const uint8_t *const *pay = (const uint8_t *const *)(sz + n);
-            NSString *e = nil;
-            NSData *spv = [[NSFileManager defaultManager] fileExistsAtPath:path] ? nil
-                        : nvmtl_translate_with_fc(ll, stage, idx, sz, pay, n, &e);
-            // written here, not on the cache-io queue, so the file is there when the group finishes
-            if (spv && nvmtl_is_spirv(spv) && nvmtl_cache_write(path, spv) == 0) gFcStored++;   // same framed format the reader proves
-            else if (!spv && e) nvlog("fc warm-up: a recorded set no longer translates: %s", e.UTF8String);
-            dispatch_semaphore_signal(nvmtl_fcwarm_slots());
-            os_unfair_lock_lock(&gFcWarmLock);
-            [gFcWarmInFlight removeObjectForKey:path];
-            os_unfair_lock_unlock(&gFcWarmLock);
-        });
+        [nvmtl_fcwarm_queue() addOperationWithBlock:^{ @autoreleasepool {
+            if (nvmtl_vk_lost()) return;
+            NSString *stage = nil;
+            __attribute__((objc_precise_lifetime)) NSMutableData *packed = nil;
+            size_t n = 0;
+            if (!nvmtl_fcwarm_unpack(key, &stage, &packed, &n)) return;
+            dispatch_group_t owner = nvmtl_fcwarm_claim(path, NULL);
+            if (!owner) return;
+            if (![nvmtl_memo() objectForKey:path] && !nvmtl_is_spirv(nvmtl_cache_read(path))) {
+                const uint32_t *idx = packed.bytes, *sz = idx + n;
+                const uint8_t *const *pay = (const uint8_t *const *)(sz + n);
+                NSString *error = nil;
+                NSData *spv = nvmtl_translate_with_fc(ll, stage, idx, sz, pay, n, &error);
+                if (nvmtl_is_spirv(spv)) {
+                    [nvmtl_memo() setObject:spv forKey:path cost:spv.length];
+                    if (nvmtl_cache_write(path, spv) == 0) gFcStored++;
+                } else if (error) nvlog("fc warm-up: a recorded set no longer translates: %s", error.UTF8String);
+            }
+            nvmtl_fcwarm_release(path, owner);
+        }}];
     }
     if (queued) nvlog("fc warm-up: %u recorded variant(s) of this function translating in the background", queued);
 }
-// A miss whose file a background translation is writing waits for it rather than translating again.
-static BOOL nvmtl_fcwarm_join(NSString *path) {
-    if (!path || !nvmtl_fcwarm_on()) return NO;
-    os_unfair_lock_lock(&gFcWarmLock);
-    dispatch_group_t g = gFcWarmInFlight[path];
-    os_unfair_lock_unlock(&gFcWarmLock);
-    if (!g) return NO;
-    const long timedOut = dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, (int64_t)NVMTL_FCWARM_JOIN_SEC * NSEC_PER_SEC));
-    nvlog("fc warm-up: JOINED the background translation%s", timedOut ? " - it did not finish in time, translating here" : "");
+static BOOL nvmtl_fcwarm_join(dispatch_group_t pending) {
+    const long timedOut = dispatch_group_wait(pending, dispatch_time(DISPATCH_TIME_NOW, (int64_t)NVMTL_FCWARM_JOIN_SEC * NSEC_PER_SEC));
+    nvlog("fc warm-up: JOINED an active translation%s", timedOut ? " - it did not finish in time, translating here" : "");
     return !timedOut;
+}
+
+static dispatch_queue_t nvmtl_fcwarm_scan_queue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("nvmtl.fc-scan", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+    });
+    return q;
+}
+static void nvmtl_fcwarm_library(NSDictionary<NSString *, NSString *> *airs) {
+    static char scannedKey;
+    if (!airs.count || getenv("NVMTL_FCCACHE_OFF") || !nvmtl_fcwarm_on()) return;
+    // Cached library wrappers share the same immutable AIR table.
+    if (objc_getAssociatedObject(airs, &scannedKey)) return;
+    objc_setAssociatedObject(airs, &scannedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    dispatch_async(nvmtl_fcwarm_scan_queue(), ^{ @autoreleasepool {
+        NSString *file = nvmtl_fcwarm_records_path();
+        if (!file) return;
+        os_unfair_lock_lock(&gFcWarmLock);
+        nvmtl_fcwarm_load_locked(file);
+        BOOL recorded = gFcWarmRecorded.count > 0;
+        os_unfair_lock_unlock(&gFcWarmLock);
+        if (!recorded) return;
+        for (NSString *ll in airs.objectEnumerator) {
+            @autoreleasepool { nvmtl_fcwarm_kick(ll, nvmtl_air_state(ll), nil); }
+        }
+    }});
 }
 
 NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *name, NSDictionary *constants,
@@ -1930,19 +1971,24 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
     NSData *hit = fcCacheOn ? [nvmtl_memo() objectForKey:memoKey] : nil;
     if (hit) { gFcHit++; gFcMemoHit++; nvmtl_cache_touch(path); nvmtl_fc_note_lookup(); return hit; }   // keep the trimmer's age order (off the caller)
     if (fcCacheOn && path) hit = nvmtl_cache_read(path);
-    if (fcCacheOn && path && !hit && nvmtl_fcwarm_join(path)) hit = nvmtl_cache_read(path);
-    uint32_t magic = 0;
-    if (hit.length >= 20 && hit.length % 4 == 0) {
-        memcpy(&magic, hit.bytes, 4);
-        if (magic == 0x07230203) {
-            gFcHit++; nvmtl_cache_touch(path);
-            [nvmtl_memo() setObject:hit forKey:memoKey cost:hit.length];
-            nvlog("fc cache: HIT %s %lu B %.1f ms [%lu hit, %lu miss, %lu stored]", name.UTF8String,
-                  (unsigned long)hit.length, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6,
-                  gFcHit, gFcMiss, gFcStored);
-            nvmtl_fc_note_lookup();
-            return hit;
+    dispatch_group_t owner = nil;
+    if (fcCacheOn && path && nvmtl_fcwarm_on()) {
+        while (!nvmtl_is_spirv(hit) && !owner) {
+            dispatch_group_t pending = nil;
+            owner = nvmtl_fcwarm_claim(path, &pending);
+            if (pending && !nvmtl_fcwarm_join(pending)) break;
+            hit = [nvmtl_memo() objectForKey:memoKey] ?: nvmtl_cache_read(path);
         }
+    }
+    if (nvmtl_is_spirv(hit)) {
+        if (owner) nvmtl_fcwarm_release(path, owner);
+        gFcHit++; nvmtl_cache_touch(path);
+        [nvmtl_memo() setObject:hit forKey:memoKey cost:hit.length];
+        nvlog("fc cache: HIT %s %lu B %.1f ms [%lu hit, %lu miss, %lu stored]", name.UTF8String,
+              (unsigned long)hit.length, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6,
+              gFcHit, gFcMiss, gFcStored);
+        nvmtl_fc_note_lookup();
+        return hit;
     }
     gFcMiss++;
     NSData *result = nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
@@ -1950,15 +1996,20 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
         clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0 >= (uint64_t)NVMTL_FCWARM_RECORD_MS * 1000000ull)
         nvmtl_fcwarm_record(airDigest, json);
     if (result) {
+        if (fcCacheOn && nvmtl_is_spirv(result)) [nvmtl_memo() setObject:result forKey:memoKey cost:result.length];
         if (path) {
             NSData *stored = [result copy]; NSString *file = [path copy];
-            nvmtl_cache_io(^{ if (nvmtl_cache_write(file, stored) == 0) gFcStored++; });
+            nvmtl_cache_io(^{
+                if (nvmtl_cache_write(file, stored) == 0) gFcStored++;
+                if (owner) nvmtl_fcwarm_release(file, owner);
+            });
+            owner = nil;   // held until async persistence finishes
         }
-        if (fcCacheOn && nvmtl_is_spirv(result)) [nvmtl_memo() setObject:result forKey:memoKey cost:result.length];
         nvlog("fc cache: miss %s %lu B %.1f ms [%lu hit, %lu miss, %lu stored]", name.UTF8String,
               (unsigned long)result.length, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6,
               gFcHit, gFcMiss, gFcStored);
     }
+    if (owner) nvmtl_fcwarm_release(path, owner);
     nvmtl_fc_note_lookup();
     return result;
 }

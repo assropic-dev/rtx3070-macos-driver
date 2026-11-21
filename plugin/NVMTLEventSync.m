@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 
+#include <pthread.h>
 #include "nvmtl_schedule_policy.h"
 
 @interface NVMTLQueueReservation : NSObject { @public __weak NVMTLCommandBuffer *buffer; } @end
@@ -11,7 +12,7 @@
 @interface NVMTLSubmissionPart : NSObject {
 @public
     nvk_cmdbuf commands;
-    NSSet *resources, *surfaces;
+    NSSet *resources, *surfaces, *sampleReads;
     NSArray *scratch;
     id waitEvent, signalEvent;
     uint64_t value;
@@ -29,13 +30,89 @@
 static _Atomic unsigned gsub_inflight;
 static _Atomic unsigned long long gsub_ahead, gsub_peak;
 static NSMutableArray *nvmtl_quarantined_parts;
-static int nvmtl_gsub_finish(NVMTLSubmissionPart *part) {
+static int nvmtl_gsub_finish_observed(NVMTLSubmissionPart *part, nvmtl_fence_observer observer, void *context) {
     nvmtl_inflight *const f = part->inflight;
     part->inflight = NULL;
-    const int r = nvmtl_vk_submit_finish(f);
+    const int r = nvmtl_vk_submit_finish_observed(f, observer, context);
     atomic_fetch_sub(&gsub_inflight, 1);
     if (r == 0) nvmtl_vk_inflight_free(f);
     return r;
+}
+static int nvmtl_gsub_finish(NVMTLSubmissionPart *part) { return nvmtl_gsub_finish_observed(part, NULL, NULL); }
+static BOOL nvmtl_ws_fence_stats_on(void) {
+    static BOOL on;
+    static uint64_t stopAt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *value = getenv("NVMTL_WS_FENCE_STATS");
+        on = value && *value && *value != '0';
+#if defined(NVMTL_WS_STARTUP_STATS_SECONDS) && NVMTL_WS_STARTUP_STATS_SECONDS > 0
+        const char *process = getprogname();
+        if (!value && process && !strcmp(process, "WindowServer")) {
+            on = YES;
+            stopAt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + NVMTL_WS_STARTUP_STATS_SECONDS * 1000000000ull;
+        }
+#endif
+    });
+    return on && (!stopAt || clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < stopAt);
+}
+// Called by the ordered execution worker (or by the synchronous pump under its class lock).
+// Count accepted per-surface final releases, with a separate denominator for calibrated command parts.
+static void nvmtl_ws_fence_stats(uint64_t ready, uint64_t gpuEnd, const nvmtl_gpu_interval *timing) {
+    static uint64_t sampled, calibrated, late, missingWait, lateEntry, lateWait, maxDelay, lastReport;
+    sampled++;
+    if (gpuEnd && gpuEnd <= ready) {
+        const uint64_t delay = ready - gpuEnd;
+        calibrated++;
+        if (delay > maxDelay) maxDelay = delay;
+        if (delay > 10000000ull) {
+            late++;
+            const uint64_t entry = timing->host_wait_begin_ns;
+            if (!entry) missingWait++;
+            else {
+                if (entry > gpuEnd && entry - gpuEnd > 10000000ull) lateEntry++;
+                const uint64_t start = entry > gpuEnd ? entry : gpuEnd;
+                if (timing->host_after_ns > start && timing->host_after_ns - start > 10000000ull) lateWait++;
+            }
+        }
+    }
+    if (ready > lastReport && ready - lastReport >= 2000000000ull) {
+        lastReport = ready;
+        nvlog_every("WindowServer fence stats: releases=%llu calibrated=%llu over_10ms=%llu max_gpu_end_to_ready_us=%llu "
+                    "late_wait_entry=%llu late_wait_return=%llu missing_wait_entry=%llu",
+                    (unsigned long long)sampled, (unsigned long long)calibrated, (unsigned long long)late,
+                    (unsigned long long)(maxDelay / 1000), (unsigned long long)lateEntry,
+                    (unsigned long long)lateWait, (unsigned long long)missingWait);
+    }
+}
+// All timestamps are in host uptime. A zero GPU timestamp means this part has no
+// calibrated device interval. On a split command buffer these times cover only the named part.
+static void nvmtl_ws_log_slow_release(uint32_t sid, uint64_t marked, uint64_t notify, uint64_t ready,
+                                      NVMTLSubmissionPart *part, uint64_t callbackEntry, uint64_t lockStart,
+                                      uint64_t lockAcquired, const char *path, BOOL accepted) {
+    if (!marked) return;
+    const BOOL stats = accepted && part && nvmtl_ws_fence_stats_on();
+    if (!stats && ready - marked < 100000000ull) return;
+    const nvmtl_gpu_interval *timing = part ? &part->commands.timing : NULL;
+    double gpuStart = 0, gpuEnd = 0;
+    if (timing) nvmtl_vk_interval_seconds(timing, &gpuStart, &gpuEnd);
+    const uint64_t gpuEndNS = (uint64_t)(gpuEnd * 1e9);
+    if (stats) nvmtl_ws_fence_stats(ready, gpuEndNS, timing);
+    if (ready - marked < 100000000ull && (!gpuEndNS || ready <= gpuEndNS || ready - gpuEndNS <= 10000000ull)) return;
+    static _Atomic uint64_t count;
+    uint64_t n = atomic_fetch_add(&count, 1) + 1;
+    if (n > 16 && (n & 255)) return;
+    nvlog_every("slow surface release %llu: sid=%u holder_mark_us=%llu part_submit_begin_us=%llu "
+          "gpu_start_us=%.0f gpu_end_us=%.0f fence_observed_us=%llu notify_begin_us=%llu ready_us=%llu "
+          "fence_callback_us=%llu holders_lock_begin_us=%llu holders_locked_us=%llu surface_release_path=%s submit_id=%llu "
+          "fence_wait_enter_us=%llu",
+          (unsigned long long)n, sid, (unsigned long long)(marked / 1000),
+          (unsigned long long)(timing ? timing->host_before_ns / 1000 : 0), gpuStart * 1e6, gpuEnd * 1e6,
+          (unsigned long long)(timing ? timing->host_after_ns / 1000 : 0),
+          (unsigned long long)(notify / 1000), (unsigned long long)(ready / 1000),
+          (unsigned long long)(callbackEntry / 1000), (unsigned long long)(lockStart / 1000),
+          (unsigned long long)(lockAcquired / 1000), path, (unsigned long long)(part ? part->commands.fx_seq : 0),
+          (unsigned long long)(timing ? timing->host_wait_begin_ns / 1000 : 0));
 }
 @interface NVMTLPendingSurfaceWrite : NSObject {
 @public __weak NVMTLCommandBuffer *buffer; __weak NVMTLTexture *texture; uint32_t seed;
@@ -44,40 +121,60 @@ static int nvmtl_gsub_finish(NVMTLSubmissionPart *part) {
 @implementation NVMTLPendingSurfaceWrite @end
 // Queue keys and command-buffer references are weak. An abandoned recording is
 // never registered; completion removes committed entries without retaining VRAM.
+// Its own lock, never the NVMTLCommandBuffer class lock: the per-bind lookup below runs under this map's lock only,
+// while the class lock is held across GPU submission by the ahead lane and by enqueue/dealloc.
 static NSMapTable *nvmtl_surface_writers;
+static pthread_mutex_t nvmtl_surface_writers_lock = PTHREAD_MUTEX_INITIALIZER;
 // surface id and plane in one tagged NSNumber: no allocation on the per-bind path (it was a formatted string)
 static id nvmtl_surface_writer_key(NVMTLTexture *t) {
     return @(((unsigned long long)IOSurfaceGetID(t->_surf) << 8) | ((unsigned long long)t->_plane & 0xff));
 }
-static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
-    if (!cb || !t || !t->_surf) return NO;
-    @synchronized ([NVMTLCommandBuffer class]) {
-        id key = nvmtl_surface_writer_key(t);
-        for (id queue in nvmtl_surface_writers.keyEnumerator) {
-            NSDictionary *writes = [nvmtl_surface_writers objectForKey:queue];
-            NVMTLPendingSurfaceWrite *write = writes[key];
-            NVMTLCommandBuffer *writer = write ? write->buffer : nil;
-            NVMTLTexture *backing = write ? write->texture : nil;
-            const BOOL sameBacking = backing && (backing == t || (backing->_vramOn && t->_vramOn));
-            if (writer && writer != cb && sameBacking && write->seed == IOSurfaceGetSeed(t->_surf)) return YES;
-        }
-        return NO;
+static BOOL nvmtl_sample_has_recorded_writer(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
+    if (!cb) return YES;
+    const uint32_t sid = IOSurfaceGetID(t->_surf);
+    // Another wrapper can name the same plane. Do not replace it with a CPU
+    // snapshot when a recorded write in this command buffer must supply its pixels.
+    for (NVMTLTexture *w in cb->_surfDirty)
+        if (w->_surf && IOSurfaceGetID(w->_surf) == sid && w->_plane == t->_plane) return YES;
+    for (NVMTLSubmissionPart *p in cb->_parts) {
+        if (![p isKindOfClass:[NVMTLSubmissionPart class]]) continue;
+        for (NVMTLTexture *w in p->surfaces)
+            if (w->_surf && IOSurfaceGetID(w->_surf) == sid && w->_plane == t->_plane) return YES;
     }
+    return NO;
+}
+static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t, BOOL *anyWriter) {
+    if (!cb || !t || !t->_surf) return NO;
+    pthread_mutex_lock(&nvmtl_surface_writers_lock);
+    id key = nvmtl_surface_writer_key(t);
+    for (id queue in nvmtl_surface_writers.keyEnumerator) {
+        NSDictionary *writes = [nvmtl_surface_writers objectForKey:queue];
+        NVMTLPendingSurfaceWrite *write = writes[key];
+        NVMTLCommandBuffer *writer = write ? write->buffer : nil;
+        if (anyWriter && writer) *anyWriter = YES;
+        NVMTLTexture *backing = write ? write->texture : nil;
+        const BOOL sameBacking = backing && (backing == t || (backing->_vramOn && t->_vramOn));
+        if (writer && writer != cb && sameBacking && write->seed == IOSurfaceGetSeed(t->_surf)) {
+            pthread_mutex_unlock(&nvmtl_surface_writers_lock);
+            return YES;
+        }
+    }
+    pthread_mutex_unlock(&nvmtl_surface_writers_lock);
+    return NO;
 }
 static void nvmtl_surface_register_writes(NVMTLCommandBuffer *cb) {
-    // The same lock as pending_write and finish_writes, taken here too: the map is shared with the completion thread, and
-    // its one caller holding this (recursive) lock today must not be what keeps WindowServer's heap intact.
-    @synchronized ([NVMTLCommandBuffer class]) {
-        if (!nvmtl_surface_writers) nvmtl_surface_writers = [NSMapTable weakToStrongObjectsMapTable];
-        NSMutableDictionary *writes = [nvmtl_surface_writers objectForKey:cb->_queue];
-        for (NVMTLSubmissionPart *part in cb->_parts) for (NVMTLTexture *t in part->surfaces) {
-            if (!t->_surf) continue;
-            if (!writes) { writes = [NSMutableDictionary new]; [nvmtl_surface_writers setObject:writes forKey:cb->_queue]; }
-            NVMTLPendingSurfaceWrite *write = [NVMTLPendingSurfaceWrite new];
-            write->buffer = cb; write->texture = t; write->seed = IOSurfaceGetSeed(t->_surf);
-            writes[nvmtl_surface_writer_key(t)] = write;
-        }
+    // Its own lock (see nvmtl_surface_writers): registration is rare, the per-bind lookup above is the hot path.
+    pthread_mutex_lock(&nvmtl_surface_writers_lock);
+    if (!nvmtl_surface_writers) nvmtl_surface_writers = [NSMapTable weakToStrongObjectsMapTable];
+    NSMutableDictionary *writes = [nvmtl_surface_writers objectForKey:cb->_queue];
+    for (NVMTLSubmissionPart *part in cb->_parts) for (NVMTLTexture *t in part->surfaces) {
+        if (!t->_surf) continue;
+        if (!writes) { writes = [NSMutableDictionary new]; [nvmtl_surface_writers setObject:writes forKey:cb->_queue]; }
+        NVMTLPendingSurfaceWrite *write = [NVMTLPendingSurfaceWrite new];
+        write->buffer = cb; write->texture = t; write->seed = IOSurfaceGetSeed(t->_surf);
+        writes[nvmtl_surface_writer_key(t)] = write;
     }
+    pthread_mutex_unlock(&nvmtl_surface_writers_lock);
 }
 // WindowServer frame completion, with NVAccel's nvSurfGpuEscape: each surface a WindowServer command buffer renders is
 // marked pending when it commits and ready when the GPU has finished it, and the swap waits for that in the kernel, off
@@ -100,7 +197,7 @@ static BOOL nvmtl_ws_kernel_waits(void) {
     return atomic_load(&nvmtl_ws_marks_on) == 1;
 }
 static const void *const nvmtl_ws_marks_key = &nvmtl_ws_marks_key;
-static void nvmtl_ws_mark(uint32_t sid, BOOL pending) { (void)nvmtl_vk_surface_gpu_mark(sid, pending); }
+static BOOL nvmtl_ws_mark(uint32_t sid, BOOL pending) { return nvmtl_vk_surface_gpu_mark(sid, pending) == 0; }
 // Marking WindowServer's surfaces newest in VRAM at commit is only safe when NVAccel's page-off waits for a pending
 // surface (NVAccelSurfaceWait). Without that wait a CPU lock or a copied present pages the surface off while the GPU
 // is still drawing it: blank window panes, a torn band, a Dock without its icons. Such an accelerator (a package that
@@ -117,7 +214,7 @@ static BOOL nvmtl_ws_surface_wait(void) {
 }
 // What one WindowServer command buffer holds: the surfaces it marked pending in the kernel, and the textures whose shared
 // VRAM its commit marked newest. early is fixed at commit (nvmtl_ws_surface_wait): the marks are released part by part.
-@interface NVMTLSurfaceHolds : NSObject { @public NSMutableSet *ids; NSSet *dirtied; BOOL early; } @end
+@interface NVMTLSurfaceHolds : NSObject { @public NSMutableSet *ids; NSSet *dirtied; BOOL early; uint64_t markedAt; } @end
 @implementation NVMTLSurfaceHolds @end
 // A texture whose part has landed while its surface is still held, published by the holder that releases it last.
 // dirtied: the commit marked its VRAM newest, so publication is bookkeeping only (nvmtlSurfaceOutDirtied:).
@@ -139,31 +236,59 @@ static NSObject *nvmtl_ws_lock(void) {
     dispatch_once(&once, ^{ lock = [NSObject new]; });
     return lock;
 }
+// Caller holds nvmtl_ws_lock. A texture written again keeps only its latest place in the order.
+static void nvmtl_ws_defer_locked(NVMTLCommandBuffer *owner, NVMTLTexture *t, BOOL dirtied, uint32_t sid) {
+    if (!nvmtl_ws_deferred) nvmtl_ws_deferred = [NSMutableDictionary new];
+    NSMutableArray *waiting = nvmtl_ws_deferred[@(sid)];
+    if (!waiting) nvmtl_ws_deferred[@(sid)] = waiting = [NSMutableArray new];
+    // Publishing this at its earlier place could let an intervening private copy leave older pixels current.
+    for (NSUInteger i = 0; i < waiting.count; i++) if (((NVMTLDeferredPublication *)waiting[i])->texture == t) { [waiting removeObjectAtIndex:i]; break; }
+    NVMTLDeferredPublication *d = [NVMTLDeferredPublication new];
+    d->texture = t; d->dirtied = dirtied; d->owner = owner;
+    [waiting addObject:d];
+}
 static void nvmtl_ws_defer(NVMTLCommandBuffer *owner, NVMTLTexture *t, BOOL dirtied, uint32_t sid) {
-    @synchronized (nvmtl_ws_lock()) {
-        if (!nvmtl_ws_deferred) nvmtl_ws_deferred = [NSMutableDictionary new];
-        NSMutableArray *waiting = nvmtl_ws_deferred[@(sid)];
-        if (!waiting) nvmtl_ws_deferred[@(sid)] = waiting = [NSMutableArray new];
-        // a texture written again keeps only its latest place in the order: published at its earlier place, a private
-        // copy written between the two would be copied out after it and leave the older pixels current
-        for (NSUInteger i = 0; i < waiting.count; i++) if (((NVMTLDeferredPublication *)waiting[i])->texture == t) { [waiting removeObjectAtIndex:i]; break; }
-        NVMTLDeferredPublication *d = [NVMTLDeferredPublication new];
-        d->texture = t; d->dirtied = dirtied; d->owner = owner;
-        [waiting addObject:d];
-    }
+    @synchronized (nvmtl_ws_lock()) { nvmtl_ws_defer_locked(owner, t, dirtied, sid); }
 }
 // One holder lets go of a surface. The last one releases the kernel mark and moves the textures waiting for it to settled.
-static void nvmtl_ws_release(NVMTLSurfaceHolds *holds, uint32_t sid, NSMutableArray *settled) {
+typedef struct { uint32_t sid; BOOL accepted; uint64_t notify, ready; } nvmtl_ws_ready_time;
+typedef struct {
+    __unsafe_unretained NVMTLCommandBuffer *cb;
+    NSUInteger index;
+    BOOL landed, published;
+    uint64_t entered, lockStart, locked, marked;
+    const char *path;
+    NSData *slow;
+} nvmtl_ws_fence_part;
+// Caller holds nvmtl_ws_lock. Only the final holder sends ready and receives the deferred publications.
+static BOOL nvmtl_ws_release_locked(NVMTLSurfaceHolds *holds, NSNumber *n, NSMutableArray *settled,
+                                    nvmtl_ws_ready_time *time) {
+    if (![holds->ids containsObject:n]) return NO;
+    [holds->ids removeObject:n];
+    [nvmtl_ws_pending_holds removeObject:n];
+    if ([nvmtl_ws_pending_holds countForObject:n]) return NO;
+    time->sid = n.unsignedIntValue;
+    time->notify = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    time->accepted = nvmtl_ws_mark(time->sid, NO);
+    time->ready = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    NSArray *waiting = nvmtl_ws_deferred[n];
+    if (waiting) { [settled addObjectsFromArray:waiting]; [nvmtl_ws_deferred removeObjectForKey:n]; }
+    return YES;
+}
+static void nvmtl_ws_report_release(nvmtl_ws_ready_time time, uint64_t mark, NVMTLSubmissionPart *part,
+                                    nvmtl_ws_fence_part *fence) {
+    nvmtl_ws_log_slow_release(time.sid, mark, time.notify, time.ready, part, fence ? fence->entered : 0,
+                              fence ? fence->lockStart : 0, fence ? fence->locked : 0,
+                              fence && fence->path ? fence->path : "legacy", time.accepted);
+}
+static void nvmtl_ws_release(NVMTLSurfaceHolds *holds, uint32_t sid, NSMutableArray *settled,
+                             NVMTLSubmissionPart *part, nvmtl_ws_fence_part *fence) {
+    nvmtl_ws_ready_time time;
     NSNumber *n = @(sid);
     @synchronized (nvmtl_ws_lock()) {
-        if (![holds->ids containsObject:n]) return;
-        [holds->ids removeObject:n];
-        [nvmtl_ws_pending_holds removeObject:n];
-        if ([nvmtl_ws_pending_holds countForObject:n]) return;
-        nvmtl_ws_mark(sid, NO);
-        NSArray *waiting = nvmtl_ws_deferred[n];
-        if (waiting) { [settled addObjectsFromArray:waiting]; [nvmtl_ws_deferred removeObjectForKey:n]; }
+        if (!nvmtl_ws_release_locked(holds, n, settled, &time)) return;
     }
+    nvmtl_ws_report_release(time, holds->markedAt, part, fence);
 }
 // Publishes what was waiting, after the marks are released. Returns NO when one of cb's own textures could not be
 // published (its command buffer fails, as before); another command buffer's has already completed, so that is logged.
@@ -194,7 +319,8 @@ static BOOL nvmtl_ws_publish_settled(NSArray *settled, NVMTLCommandBuffer *cb) {
 // still in flight took the CPU path (page-off, wait, 8 MB upload) on the compositor's thread, and a 144 Hz desktop ran
 // at 90 frames a second.
 static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
-    if (!nvmtl_ws_kernel_waits()) return;
+    cb->_wsWaitForCompletion = !nvmtl_ws_kernel_waits();
+    if (cb->_wsWaitForCompletion) return;
     NSMutableSet *ids = nil;
     for (NVMTLSubmissionPart *part in cb->_parts) {
         if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
@@ -227,7 +353,11 @@ static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
     }
     @synchronized (nvmtl_ws_lock()) {
         if (!nvmtl_ws_pending_holds) nvmtl_ws_pending_holds = [NSCountedSet new];
-        for (NSNumber *n in ids) { [nvmtl_ws_pending_holds addObject:n]; nvmtl_ws_mark(n.unsignedIntValue, YES); }
+        holds->markedAt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        for (NSNumber *n in ids) {
+            [nvmtl_ws_pending_holds addObject:n];
+            if (!nvmtl_ws_mark(n.unsignedIntValue, YES)) cb->_wsWaitForCompletion = YES;
+        }
     }
     objc_setAssociatedObject(cb, nvmtl_ws_marks_key, holds, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
@@ -237,7 +367,7 @@ static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
 // receives what the releases freed, to be published after them (a CPU lock waiting in the page-off for a mark holds the
 // surface's lock, which publication takes). Released earlier, the swap or a capture would read the surface with a later
 // part's write still in flight.
-static NSArray *nvmtl_ws_part_landed(NVMTLCommandBuffer *cb, NSUInteger index, NSMutableArray *settled) {
+static NSArray *nvmtl_ws_part_landed(NVMTLCommandBuffer *cb, NSUInteger index, NSMutableArray *settled, nvmtl_ws_fence_part *atFence) {
     NVMTLSubmissionPart *part = cb->_parts[index];
     NVMTLSurfaceHolds *holds = objc_getAssociatedObject(cb, nvmtl_ws_marks_key);
     NSMutableArray *publish = [NSMutableArray new];
@@ -256,8 +386,86 @@ static NSArray *nvmtl_ws_part_landed(NVMTLCommandBuffer *cb, NSUInteger index, N
         }
         if (!later) [last addObject:@(sid)];
     }
-    for (NSNumber *n in last) nvmtl_ws_release(holds, n.unsignedIntValue, settled);
+    for (NSNumber *n in last) nvmtl_ws_release(holds, n.unsignedIntValue, settled, part, atFence);
     return publish;
+}
+
+// A fence is sufficient for planes whose commit already marked their shared backing newest.
+// Only metadata-only deferred publications can join this path. Full publication and overlapping owners retain the fallback.
+static void nvmtl_ws_fence_landed(void *context) {
+    nvmtl_ws_fence_part *fence = context;
+    fence->entered = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    NVMTLCommandBuffer *cb = fence->cb;
+    NVMTLSubmissionPart *part = cb->_parts[fence->index];
+    NVMTLSurfaceHolds *holds = objc_getAssociatedObject(cb, nvmtl_ws_marks_key);
+    NSMutableSet<NSNumber *> *surfaceIDs = [NSMutableSet new];
+    for (NVMTLTexture *t in part->surfaces) {
+        // A part retains these roots. Their shared backing is installed at creation and cleared only by dealloc.
+        if (t->_parent || !t->_surf || !t->_vramOn || ![holds->dirtied containsObject:t]) {
+            fence->path = "mixed-backing"; return;
+        }
+        [surfaceIDs addObject:@(IOSurfaceGetID(t->_surf))];
+    }
+    for (NSUInteger i = fence->index + 1; i < cb->_parts.count; i++) {
+        NVMTLSubmissionPart *later = cb->_parts[i];
+        if (![later isKindOfClass:[NVMTLSubmissionPart class]]) continue;
+        for (NVMTLTexture *t in later->surfaces) {
+            if (t->_surf && [surfaceIDs containsObject:@(IOSurfaceGetID(t->_surf))]) {
+                fence->path = "later-write"; return;
+            }
+        }
+    }
+    NSArray<NSNumber *> *ids = surfaceIDs.allObjects;
+    NSMutableData *storage = [NSMutableData dataWithLength:ids.count * sizeof(nvmtl_ws_ready_time)];
+    nvmtl_ws_ready_time *times = storage.mutableBytes;
+    if (!times) { fence->path = "no-storage"; return; }
+    NSMutableArray *settled = nil;
+    fence->lockStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    @synchronized (nvmtl_ws_lock()) {
+        fence->locked = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        BOOL hasDeferred = NO;
+        for (NSNumber *sid in ids) {
+            if (![holds->ids containsObject:sid] || [nvmtl_ws_pending_holds countForObject:sid] != 1) {
+                fence->path = "shared-ownership"; return;
+            }
+            NSArray<NVMTLDeferredPublication *> *waiting = nvmtl_ws_deferred[sid];
+            for (NVMTLDeferredPublication *d in waiting) {
+                NVMTLTexture *t = d->texture;
+                if (!d->dirtied || t->_parent || !t->_surf || !t->_vramOn) {
+                    fence->path = "deferred-publication"; return;
+                }
+            }
+            if (waiting.count) hasDeferred = YES;
+        }
+        if (hasDeferred) {
+            settled = [NSMutableArray new];
+            for (NVMTLTexture *t in part->surfaces)
+                nvmtl_ws_defer_locked(cb, t, YES, (uint32_t)IOSurfaceGetID(t->_surf));
+        }
+        // Each holder is exclusively ours until this transition finishes. Preserve publication order outside this lock.
+        for (NSUInteger i = 0; i < ids.count; i++)
+            (void)nvmtl_ws_release_locked(holds, ids[i], settled, &times[i]);
+    }
+    fence->landed = fence->published = YES;
+    fence->path = settled ? "at-fence-deferred" : "at-fence"; fence->marked = holds->markedAt;
+    if (nvmtl_ws_fence_stats_on()) fence->slow = storage;
+    for (NSUInteger i = 0; !fence->slow && i < ids.count; i++)
+        if (times[i].ready - holds->markedAt >= 100000000ull) { fence->slow = storage; break; }
+    if (settled) {
+        fence->published = nvmtl_ws_publish_settled(settled, cb);
+    } else {
+        for (NVMTLTexture *texture in part->surfaces)
+            if (![texture nvmtlSurfaceOutDirtied:YES]) fence->published = NO;
+    }
+    static _Atomic bool announced;
+    if (!atomic_load(&announced)) {
+        for (NSUInteger i = 0; i < ids.count; i++) {
+            if (times[i].accepted && !atomic_exchange(&announced, true)) {
+                nvlog("WindowServer surface %u: GPU fence signalled, kernel ready accepted before command retirement", times[i].sid);
+                break;
+            }
+        }
+    }
 }
 // The command buffer has finished (or failed): every hold it still has is released, and what was waiting is published.
 static void nvmtl_ws_mark_ready(NVMTLCommandBuffer *cb) {
@@ -265,20 +473,20 @@ static void nvmtl_ws_mark_ready(NVMTLCommandBuffer *cb) {
     if (!holds) return;
     NSArray *ids; @synchronized (nvmtl_ws_lock()) { ids = holds->ids.allObjects; }
     NSMutableArray *settled = [NSMutableArray new];
-    for (NSNumber *n in ids) nvmtl_ws_release(holds, n.unsignedIntValue, settled);
+    for (NSNumber *n in ids) nvmtl_ws_release(holds, n.unsignedIntValue, settled, nil, NULL);
     objc_setAssociatedObject(cb, nvmtl_ws_marks_key, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     (void)nvmtl_ws_publish_settled(settled, nil);
 }
 static void nvmtl_surface_finish_writes(NVMTLCommandBuffer *cb) {
     nvmtl_ws_mark_ready(cb);
-    @synchronized ([NVMTLCommandBuffer class]) {
-        NSMutableDictionary *writes = [nvmtl_surface_writers objectForKey:cb->_queue];
-        for (id key in [writes.allKeys copy]) {
-            NVMTLPendingSurfaceWrite *write = writes[key];
-            if (!write->buffer || write->buffer == cb) [writes removeObjectForKey:key];
-        }
-        if (!writes.count) [nvmtl_surface_writers removeObjectForKey:cb->_queue];
+    pthread_mutex_lock(&nvmtl_surface_writers_lock);
+    NSMutableDictionary *writes = [nvmtl_surface_writers objectForKey:cb->_queue];
+    for (id key in [writes.allKeys copy]) {
+        NVMTLPendingSurfaceWrite *write = writes[key];
+        if (!write->buffer || write->buffer == cb) [writes removeObjectForKey:key];
     }
+    if (!writes.count) [nvmtl_surface_writers removeObjectForKey:cb->_queue];
+    pthread_mutex_unlock(&nvmtl_surface_writers_lock);
 }
 
 static NSMutableDictionary *nvmtl_busy_latest;
@@ -315,14 +523,17 @@ static void nvmtl_busy_mark_done(NVMTLCommandBuffer *cb) {
     NSDictionary *marks = cb->_busyMarks;
     if (!marks) return;
     cb->_busyMarks = nil;
+    BOOL published = NO;
     for (NSString *key in marks) {
         NSArray *m = marks[key]; NVMTLTexture *t = m[0]; const uint64_t seq = [m[1] unsignedLongLongValue];
         @synchronized (nvmtl_busy_lock()) {
             if ([nvmtl_busy_latest[key] unsignedLongLongValue] != seq) continue;
             [nvmtl_busy_latest removeObjectForKey:key];
             nvmtl_busy_write(t->_surf, t->_plane, seq, 1);
+            published = YES;
         }
     }
+    if (published) nvmtl_busy_notify_done();
 }
 
 @implementation NVMTLSubmissionPart
@@ -375,6 +586,7 @@ static int nvmtl_skip_empty_on(void) {
     part->commands = _c;
     memset(&_c, 0, sizeof(_c));
     part->resources = [(NVMTLResSet *)_resources nvmtlTakeAll]; part->surfaces = [_surfDirty copy];
+    part->sampleReads = _sampleReads; _sampleReads = nil;
     // Another process may read an IOSurface once its writer is scheduled, and nothing orders its queue after ours.
     // A surface whose VRAM is shared is covered by the kernel (a CPU lock's page-off waits for the pending write); one we
     // write through a private image is copied out only after the GPU has finished, and a CPU lock does not wait for that.
@@ -418,6 +630,7 @@ static int nvmtl_skip_empty_on(void) {
     }
 }
 - (void)nvmtlRecordWait:(id)event value:(uint64_t)value {
+    if (event) _sampleEventWait = YES;
     if (!event || _committed) return;
     if (nvmtl_g79_on(NVMTL_G79_EV)) {
         BOOL self_ = NO;
@@ -495,7 +708,7 @@ static int nvmtl_skip_empty_on(void) {
     // The ahead pass can run on another thread (nvmtl_ahead_kick). Close the parts to it first, so it cannot submit a
     // part this loop has already passed: that part's fence and its in-flight slot would never come back.
     @synchronized ([NVMTLCommandBuffer class]) { _partsRetiring = YES; }
-    if (_scheduleAfterPublish) { _scheduleAfterPublish = NO; [self nvmtlMarkScheduled]; }
+    if (_scheduleAfterPublish && !error) { _scheduleAfterPublish = NO; [self nvmtlMarkScheduled]; }
     for (NSUInteger i = _nextPart; i < _parts.count; i++) {
         NVMTLSubmissionPart *p = _parts[i];
         if (![p isKindOfClass:[NVMTLSubmissionPart class]] || !p->inflight) continue;
@@ -533,6 +746,12 @@ static int nvmtl_skip_empty_on(void) {
     _legacyKernelEnd = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
     _cbError = error; _cbstatus = error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
     _executionDone = YES;
+    if (error && !_wasScheduled) {
+        // Release clients waiting for the scheduled phase with the actual error visible to their handlers.
+        NSArray *handlers = [_scheduledHandlers copy]; [_scheduledHandlers removeAllObjects];
+        [self nvmtlDispatchHandlers:handlers scheduled:YES];
+        [_completionCondition broadcast];
+    }
     [_completionCondition unlock];
     @synchronized ([NVMTLCommandBuffer class]) { [_parts removeAllObjects]; }
     // A finished command buffer lets go of everything only its GPU work needed: the setBytes ring and the scratch
@@ -547,7 +766,26 @@ static int nvmtl_skip_empty_on(void) {
     if (!error) nvmtl_res2_cb_done(self);
     [self nvmtlReleaseCapacity];
 }
+// Optional pid-provider boundaries for the terminal submitted part. The worker
+// advances and finishes callbacks for this object on the same thread. Its
+// pending/batch ownership keeps the identity valid between those two calls.
+// Phases 1/2 bracket FinishExecution; 3/4 bracket callback bookkeeping.
+// Client handlers themselves run on their own queue. No file I/O occurs here.
+static uint64_t nvmtl_fence_trace_limit(void);
+static __thread const void *nvmtl_terminal_cb;
+static __thread uint64_t nvmtl_terminal_id;
+__attribute__((noinline, used, visibility("hidden")))
+void nvmtl_fence_trace_finish_marker(uint64_t submit_id, unsigned phase, const void *command)
+{
+    __asm__ volatile("" : : "r"(submit_id), "r"(phase), "r"(command) : "memory");
+}
 - (void)nvmtlFinishCallbacks {
+    const uint64_t terminal = nvmtl_terminal_cb == (__bridge const void *)self ? nvmtl_terminal_id : 0;
+    if (terminal) {
+        nvmtl_terminal_cb = NULL;
+        nvmtl_terminal_id = 0;
+        nvmtl_fence_trace_finish_marker(terminal, 3, (__bridge const void *)self);
+    }
     if (nvmtl_cbt_on() && _cbtSeq)
         // C seq create commit firstSubmit gpuStart gpuEnd fenceSeen done nDispatch firstKernel (ns, CLOCK_UPTIME_RAW)
         nvmtl_cbt_line("C %llu %llu %llu %llu %llu %llu %llu %llu %u %s\n", (unsigned long long)_cbtSeq,
@@ -560,6 +798,7 @@ static int nvmtl_skip_empty_on(void) {
     [self nvmtlDispatchHandlers:handlers scheduled:NO];
     _completionReady = YES;
     [_completionCondition broadcast]; [_completionCondition unlock];
+    if (terminal) nvmtl_fence_trace_finish_marker(terminal, 4, (__bridge const void *)self);
 }
 static unsigned nvmtl_gsub_cap(void) {
     static int cap = -1;
@@ -648,17 +887,18 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
         if (atomic_load(&gsub_inflight) >= nvmtl_gsub_cap()) return NO;
         NVMTLSubmissionPart *part = _parts[_nextSubmit];
         if (![part isKindOfClass:[NVMTLSubmissionPart class]]) return NO;
-        if (part->claimed) return NO;
+        if (part->claimed || part->aheadFailed) return NO;
         if (part->waitEvent) {
             if (!nvmtl_evfold_on() || nvmtl_evfold_promised(part->waitEvent) < part->value) return NO;
             part->waitFolded = YES; _nextSubmit++; nvmtl_evfold_census(&gEvFold, "event waits ordered by the channel (no CPU hold)");
             continue;
         }
         if (!part->commands.cb) return NO;
+        if (part->sampleReads && !nvmtl_ws_sample_check(part->sampleReads, self, YES)) return NO;
         if (!part->encoders && !part->resources.count && !part->surfaces.count && !part->scratch.count && nvmtl_skip_empty_on()) {
             if (!nvmtl_evfold_on() || (_nextSubmit + 1 >= _parts.count && (part->signalEvent || part->signals.count))) return NO;
-            [self nvmtlMarkScheduled];
-        if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
+            if (!objc_getAssociatedObject(self, nvmtl_ws_marks_key)) [self nvmtlMarkScheduled];
+            if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
             nvmtl_vk_cmd_abandon(&part->commands);
             part->aheadEmpty = YES; _nextSubmit++;
             nvmtl_evfold_promise_part(part);
@@ -674,16 +914,18 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
         nvmtl_inflight *f = nvmtl_vk_inflight_new();
         if (!f) return NO;
         for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
-        [self nvmtlMarkScheduled];
         if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
         const int r = nvmtl_vk_submit_begin(&part->commands, f);
-        _nextSubmit++;
         if (r) {
             nvmtl_vk_inflight_free(f);
+            // Keep this reservation blocked until the worker reports the error.
             part->aheadFailed = r;
             return NO;
         }
+        _nextSubmit++;
         part->inflight = f;
+        // A scheduled handler can hand the surface to the display. Its wait starts after queue acceptance.
+        [self nvmtlMarkScheduled];
         nvmtl_evfold_promise_part(part);
         const unsigned long long n = atomic_fetch_add(&gsub_inflight, 1) + 1;
         if (n > atomic_load(&gsub_peak)) atomic_store(&gsub_peak, n);
@@ -695,10 +937,16 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
 static void nvmtl_ahead_kick(void);
 static void nvmtl_gsub_ahead_pass1(void);
 static void nvmtl_gsub_ahead_pass(void) {
-    for (int round = 0; round < 64; round++) {
-        const unsigned long long before = atomic_load(&gEvFold);
-        nvmtl_gsub_ahead_pass1();
-        if (atomic_load(&gEvFold) == before) break;
+    // Both execution queues use the same lock as enqueue, dealloc and retirement.
+    // Keep reservation traversal and the ordered submit together. A later part
+    // may advance only after the queue has accepted its predecessor.
+    @synchronized ([NVMTLCommandBuffer class]) {
+        if (!nvmtl_pumping) return;
+        for (int round = 0; round < 64; round++) {
+            const unsigned long long before = atomic_load(&gEvFold);
+            nvmtl_gsub_ahead_pass1();
+            if (atomic_load(&gEvFold) == before) break;
+        }
     }
 }
 static void nvmtl_gsub_ahead_pass1(void) {
@@ -731,18 +979,25 @@ static void nvmtl_gsub_ahead_pass1(void) {
         if (have < part->value) { @synchronized ([NVMTLCommandBuffer class]) { part->claimed = NO; } return NO; }
     }
     if (!ahead && part->commands.cb && !part->encoders && !part->resources.count && !part->surfaces.count && !part->scratch.count && nvmtl_skip_empty_on()) {
-        [self nvmtlMarkScheduled];
+        // An empty leading event part has not submitted any pixels for a surface-writing buffer.
+        if (!objc_getAssociatedObject(self, nvmtl_ws_marks_key)) [self nvmtlMarkScheduled];
         if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
         nvmtl_vk_cmd_abandon(&part->commands);
         const unsigned long long k = atomic_fetch_add(&gSkipEmpty, 1);
         if (!k || ((k + 1) & 0xFFF) == 0) nvlog("commit: %llu empty submission parts NOT submitted (no encoder, no resources) - each WAS a full submit + wait", k + 1);
     }
     if (part->commands.cb || ahead) {
-        [self nvmtlMarkScheduled];
         if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
+        nvmtl_ws_fence_part fence = { .cb = self, .index = _nextPart };
+        nvmtl_fence_observer observer = NULL;
+        if (part->surfaces.count && !_wsWaitForCompletion && nvmtl_async_commit_on()) {
+            NVMTLSurfaceHolds *holds = objc_getAssociatedObject(self, nvmtl_ws_marks_key);
+            if (holds && holds->early && holds->dirtied.count) observer = nvmtl_ws_fence_landed;
+        }
         int result;
-        if (part->inflight) result = nvmtl_gsub_finish(part);
+        if (part->inflight) result = nvmtl_gsub_finish_observed(part, observer, &fence);
         else if (part->aheadFailed) result = part->aheadFailed;
+        else if (part->sampleReads && !nvmtl_ws_sample_check(part->sampleReads, self, NO)) result = -1;
         else {
             nvmtl_prepare_submission_copies(part);
             for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
@@ -750,20 +1005,25 @@ static void nvmtl_gsub_ahead_pass1(void) {
             // accepted it. Publish that progress before waiting on its fence so
             // the ahead lane can issue later parts in the same queue.
             nvmtl_inflight *f = nvmtl_vk_inflight_new();
-            if (!f) result = nvmtl_vk_submit_wait(&part->commands);
-            else {
+            if (!f) {
+                result = nvmtl_vk_submit_wait(&part->commands);
+                if (!result) [self nvmtlMarkScheduled];
+            } else {
                 result = nvmtl_vk_submit_begin(&part->commands, f);
-                if (!result) {
+                if (result) {
+                    // begin did not transfer a fence to the caller.
+                    nvmtl_vk_inflight_free(f);
+                } else {
+                    [self nvmtlMarkScheduled];
                     @synchronized ([NVMTLCommandBuffer class]) {
                         if (_nextSubmit <= _nextPart) _nextSubmit = _nextPart + 1;
                         nvmtl_evfold_promise_part(part);
                     }
                     if (nvmtl_gsub_ahead_on()) nvmtl_ahead_kick();
-                    result = nvmtl_vk_submit_finish(f);
+                    result = nvmtl_vk_submit_finish_observed(f, observer, &fence);
+                    // An accepted submit with an uncertain fence retains its state.
+                    if (!result) nvmtl_vk_inflight_free(f);
                 }
-                // Retain uncertain submission state on an error, as the ahead
-                // path does; the owning part enters quarantine on device loss.
-                if (!result) nvmtl_vk_inflight_free(f);
             }
         }
         if (result == -2) {
@@ -775,9 +1035,17 @@ static void nvmtl_gsub_ahead_pass1(void) {
         if (published) {
             // the GPU has finished this part: its surfaces' kernel marks are released (nvmtl_ws_part_landed) before the
             // surface work below, which takes the surface's own lock
-            NSMutableArray *settled = [NSMutableArray new];
-            for (NVMTLTexture *texture in nvmtl_ws_part_landed(self, _nextPart, settled)) if (![texture nvmtlSurfaceOut]) published = NO;
-            if (!nvmtl_ws_publish_settled(settled, self)) published = NO;
+            if (fence.landed) {
+                published = fence.published;
+                const nvmtl_ws_ready_time *times = fence.slow.bytes;
+                for (NSUInteger i = 0; i < fence.slow.length / sizeof(*times); i++)
+                    nvmtl_ws_report_release(times[i], fence.marked, part, &fence);
+            } else {
+                NSMutableArray *settled = [NSMutableArray new];
+                for (NVMTLTexture *texture in nvmtl_ws_part_landed(self, _nextPart, settled, &fence))
+                    if (![texture nvmtlSurfaceOut]) published = NO;
+                if (!nvmtl_ws_publish_settled(settled, self)) published = NO;
+            }
             for (NVMTLBuffer *buffer in nvmtl_submission_copies(part->resources, YES)) nvmtl_buffer_sync_out(buffer);
         }
         if (!published) {
@@ -810,8 +1078,18 @@ static void nvmtl_gsub_ahead_pass1(void) {
         ((void(*)(id,SEL,uint64_t))objc_msgSend)(event, @selector(setSignaledValue:), [s[1] unsignedLongLongValue]);
     }
     @synchronized ([NVMTLCommandBuffer class]) { _parts[_nextPart++] = [NSNull null]; }
-    if (_nextPart == _parts.count) { nvtrace("COMPLETE cb %p t=%llu", (__bridge void *)self, (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000));
-        [self nvmtlFinishExecution:nil]; }
+    if (_nextPart == _parts.count) {
+        nvtrace("COMPLETE cb %p t=%llu", (__bridge void *)self, (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000));
+        const uint64_t id = part->commands.fx_seq;
+        const bool trace = id && id <= nvmtl_fence_trace_limit();
+        if (trace) nvmtl_fence_trace_finish_marker(id, 1, (__bridge const void *)self);
+        [self nvmtlFinishExecution:nil];
+        if (trace) {
+            nvmtl_fence_trace_finish_marker(id, 2, (__bridge const void *)self);
+            nvmtl_terminal_cb = (__bridge const void *)self;
+            nvmtl_terminal_id = id;
+        }
+    }
     return YES;
 }
 - (void)nvmtlSubmitWithEvents {
@@ -881,7 +1159,7 @@ static void nvmtl_ahead_kick(void) {
     dispatch_async(ahead, ^{
         do {
             atomic_store(&nvmtl_ahead_state, 1);
-            @autoreleasepool { @synchronized ([NVMTLCommandBuffer class]) { if (nvmtl_pumping) nvmtl_gsub_ahead_pass(); } }
+            @autoreleasepool { nvmtl_gsub_ahead_pass(); }
             int running = 1;
             if (atomic_compare_exchange_strong(&nvmtl_ahead_state, &running, 0)) break;
         } while (1);
@@ -904,9 +1182,9 @@ static void nvmtl_pump_buffers(void) {
         dispatch_async(worker, ^{
             for (;;) { @autoreleasepool {
                 nvmtl_vk_clock_refresh();
+                if (nvmtl_gsub_ahead_on()) nvmtl_gsub_ahead_pass();
                 NSArray *batch; uint64_t generation;
                 @synchronized ([NVMTLCommandBuffer class]) {
-                    if (nvmtl_gsub_ahead_on()) nvmtl_gsub_ahead_pass();
                     batch = [nvmtl_pending_buffers copy]; generation = nvmtl_pump_generation;
                 }
                 BOOL progress = NO;

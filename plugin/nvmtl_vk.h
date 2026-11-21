@@ -7,14 +7,23 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include "nvmtl_host_owner.h"
 const char *nvmtl_image_ident(const void *addr, char *out, size_t n);
 // bind_lost: a sparse rebind AND its restore were both refused, so we do not know which allocation the
 // page tables name. Neither is safe to free, so the destroy path keeps both and counts the bytes.
-typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; size_t poff; int imported; int bar1; size_t moff; int sparse, sysmem; int mtype1; /* memory type + 1 when known */
+typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; union { size_t poff; size_t host_created_us; }; int imported; int bar1; size_t moff; int sparse, sysmem; int mtype1; /* memory type + 1 when known */
                  uint32_t reg; /* handle in the live GPU-range registry (nvmtl_live.h), 0 when unregistered */
                  int fresh; /* host-visible memory from its own vkAllocateMemory: zeroed by the kernel, never recycled */
-                 uint64_t parked_ns; /* when the buffer park took it (CLOCK_UPTIME_RAW) */  void *lost_mem; int bind_lost;
-                 uint8_t hz_ut; /* hazard model: 0 not yet known, 1 tracked, 2 untracked (Metal hazardTrackingMode) */ } nvk_buffer;
+                 union { uint64_t parked_ns; uint64_t host_import_id; }; /* Host imports never enter the buffer park. */
+                 void *lost_mem; int bind_lost;
+                 uint8_t hz_ut; /* hazard model: 0 not yet known, 1 tracked, 2 untracked (Metal hazardTrackingMode) */
+                 uint8_t host_origin; /* initial host import site, in the existing tail padding */ } nvk_buffer;
+/* Only the per-texture cache owns the alias and its reserved retirement slot. */
+typedef struct {
+    nvk_buffer buffer;
+    nvmtl_host_alias *alias;
+    void *retirement;
+} nvmtl_host_page_cache;
 #include "nvmtl_sample_positions.h"
 #include "nvmtl_fault_context.h"
 #include "nvmtl_page_life.h"
@@ -25,6 +34,7 @@ typedef struct { void *img; void *mem; void *view; uint32_t w, h; size_t alloc; 
                  void *pool; size_t poff, poollen; /* NVMTL_IMAGE_POOL: the pool block this image lives in and its reserved range */
                  size_t hz_off, hz_len;   /* placed: the image's byte range of mem, for the hazard model (0 = all of mem) */
                  void *sparse;   /* a sparse image (NVMTL_SPARSE_TEXTURES=1): its nvmtl_vk_sparse_info, freed with the image */
+                 size_t snapshot_charge; /* a compositor image and its staging, until the backing is released */
                  uint8_t hz_ut; } nvk_image;   /* hazard model: 0 not yet known, 1 tracked, 2 untracked (Metal hazardTrackingMode) */
 #define NVMTL_NVAR 16
 #define NVMTL_NVAR_MAX 4096
@@ -74,7 +84,7 @@ typedef struct {
 } nvmtl_gpu_clock;
 typedef struct {
     nvmtl_gpu_clock clock;
-    uint64_t start_tick, end_tick, host_before_ns, host_after_ns;
+    uint64_t start_tick, end_tick, host_before_ns, host_after_ns, host_wait_begin_ns;
     unsigned valid;
 } nvmtl_gpu_interval;
 void nvmtl_vk_clock_refresh(void);
@@ -147,6 +157,12 @@ enum { NVP_BEGIN, NVP_BUFNEW, NVP_BUFPOOL, NVP_BUFDEL, NVP_HEAP, NVP_SYNCIN, NVP
 uint64_t nvmtl_perf_now(void);
 void nvmtl_perf_note(int what, uint64_t t0, uint64_t bytes);
 int  nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out);
+int  nvmtl_vk_buffer_import_nocopy(void *ptr, size_t size, nvk_buffer *out);
+nvmtl_host_alias *nvmtl_vk_host_alias_create(void *base, size_t bytes);
+void nvmtl_vk_host_alias_release(void *context);
+void nvmtl_vk_note_host_import(nvk_buffer *b, unsigned origin, int owner);
+void *nvmtl_vk_reserve_host_retirement(void);
+void nvmtl_vk_destroy_owned_host_buffer(nvk_buffer *b, nvmtl_host_owner owner, void *reservation);
 size_t nvmtl_vk_host_import_align(void);
 #define NVMTL_MAX_GEOMS 256
 typedef struct { void *as; uint64_t addr; size_t size; int instance; } nvk_accel;
@@ -327,6 +343,8 @@ int  nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
 #define nvmtl_vk_submit_wait(c) nvmtl_vk_submit_wait_at((c), __func__)
 #define nvmtl_vk_submit_begin(c, f) nvmtl_vk_submit_begin_at((c), (f), __func__)
 int  nvmtl_vk_submit_finish(nvmtl_inflight *f);
+typedef void (*nvmtl_fence_observer)(void *context);
+int nvmtl_vk_submit_finish_observed(nvmtl_inflight *f, nvmtl_fence_observer observer, void *context);
 void nvmtl_vk_gsub_nvk_stats(uint64_t *out, unsigned n);
 int nvmtl_vk_pre_open(void);
 int nvmtl_vk_pre_copy(nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
@@ -336,9 +354,11 @@ extern void (*nvmtl_pre_release_hook)(void *);
 extern void (*nvmtl_pre_submit_hook)(void);
 int  nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_bytes);
 int  nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes);
-int  nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache);
-int  nvmtl_vk_image_read_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache);
-void nvmtl_vk_host_pages_drop(nvk_buffer *cache);
+int  nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvmtl_host_page_cache *cache);
+int  nvmtl_vk_image_write_host_observed(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes,
+                                        nvmtl_host_page_cache *cache, uint64_t observed[2]);
+int  nvmtl_vk_image_read_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvmtl_host_page_cache *cache);
+void nvmtl_vk_host_pages_drop(nvmtl_host_page_cache *cache);
 /* The surface and cookie the next host-page copy on this thread belongs to (cookie 0 = none): lets wrappers of one surface share an import (NVMTL_HOST_PAGES_SHARE=1). */
 void nvmtl_vk_host_pages_key(uint32_t surface_id, uint64_t cookie);
 int  nvmtl_vk_copy_buffer(nvk_queue *q, nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
@@ -498,9 +518,16 @@ int nvmtl_vk_cmd_blit_convert(nvk_cmdbuf *c, nvk_image *src, uint32_t sl, uint32
 void nvmtl_vk_buffer_destroy(nvk_buffer *b);
 int nvmtl_vk_buffer_readback(nvk_buffer *b, size_t off, size_t len, void *dst);
 void nvmtl_vk_image_destroy(nvk_image *i);
+void nvmtl_vk_surface_upload_image_destroy(nvk_image *i, const nvmtl_host_page_cache *cache);
 // Finish any in-flight asynchronous texture upload to this image (NVMTL_ASYNC_TEX_UPLOAD) before its memory
 // is read back, migrated or freed. A no-op when none is pending, which is always the case with the flag off.
 void nvmtl_vk_image_upload_barrier(nvk_image *img);
+// Queue a private pixel snapshot into a fresh, single-level 2D image sampled by a fragment shader.
+int nvmtl_vk_create_sample_snapshot(uint32_t w, uint32_t h, uint32_t format, nvk_image *out);
+int nvmtl_vk_upload_sample_snapshot(nvk_queue *q, nvk_image *img, const void *pixels, size_t row);
+void nvmtl_vk_park_sample_snapshot(nvk_image *img);
+void nvmtl_ws_snapshot_stats(uint64_t out[3]);
+uint64_t nvmtl_ws_snapshot_recycles(void);
 void nvmtl_vk_queue_destroy(nvk_queue *q);
 size_t nvmtl_vk_allocated_bytes(void);
 uint64_t nvmtl_vk_buffer_address(nvk_buffer *b);
@@ -562,5 +589,6 @@ int nvmtl_vk_surface_share_on(void);
 int nvmtl_vk_surface_vram(uint32_t surfaceID, uint32_t plane, size_t need, nvk_buffer *out);
 int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane);
 int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane);
+void nvmtl_vk_prepare_surface_dirty_retry(void);
 uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending);
 int nvmtl_vk_accel_surface_wait(void);

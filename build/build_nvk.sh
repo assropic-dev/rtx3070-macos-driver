@@ -43,7 +43,7 @@ case $REL in
   2.9) FIXES=$NVK/nvk-fixes-after-def16.patch
        CHAIN="nvk-macos @FIXES nvk-620-kernel nvk-recycle nvk-slab nvk-slabdef nvk-hubfix nvk-perf-boost-burst nvk-rated-tdp nvk-gps-maxpower nvk-metal-wsi nvk-card-select hwrt/ttu-nak hwrt/ttu-rq curves/curves hwrt/wide nvk-warnings nvk-unbound-stage nvk-diag-nofollow" ;;
   3.0) FIXES=$NVK/nvk-fixes-after-def16.patch   # 2.9's set plus the uncached command stream
-       CHAIN="nvk-macos @FIXES nvk-620-kernel nvk-recycle nvk-slab nvk-slabdef nvk-hubfix nvk-perf-boost-burst nvk-rated-tdp nvk-gps-maxpower nvk-metal-wsi nvk-card-select hwrt/ttu-nak hwrt/ttu-rq curves/curves hwrt/wide nvk-warnings nvk-unbound-stage nvk-diag-nofollow nvk-stream-uncached" ;;
+       CHAIN="nvk-macos @FIXES nvk-620-kernel nvk-recycle nvk-slab nvk-slabdef nvk-hubfix nvk-perf-boost-burst nvk-rated-tdp nvk-gps-maxpower nvk-metal-wsi nvk-card-select hwrt/ttu-nak hwrt/ttu-rq curves/curves hwrt/wide nvk-warnings nvk-unbound-stage nvk-diag-nofollow nvk-fence-trace nvk-stream-uncached" ;;
   2.8) FIXES=$NVK/release-2.8/nvk-fixes-after-def16.patch
        BASE=17ca6174   # the 2.8 / 2.8.1 package was built on this Mesa; 2.9 moved to nvk/MESA_BASE (26.3)
        CHAIN="nvk-macos @FIXES nvk-620-kernel nvk-recycle nvk-slab nvk-slabdef" ;;
@@ -74,6 +74,8 @@ cp "$NVK/hwrt/nvk_hwrt.h" "$NVK/hwrt/nvk_hwrt_layout.h" "$NVK/curves/nvk_curve.h
 cp "$NVK/hwrt/encode_wide.comp" "$NVK/hwrt/encode_wide_body.h" "$S/src/nouveau/vulkan/bvh/"
 cp "$NVK/curves/curve_math.h" "$S/src/nouveau/vulkan/nvk_curve_math.h"
 sed 's/#include "curve_math.h"/#include "nvk_curve_math.h"/' "$NVK/curves/curve_nir.h" > "$S/src/nouveau/vulkan/nvk_curve_nir.h"
+# Private diagnostic ABI shared by the optional single-fence trace hook and Metal.
+if [ "$REL" = 3.0 ]; then cp "$NVK/nv_fence_trace.h" "$S/src/nouveau/vulkan/nvkmd/nvrm/"; fi
 # the nvrm directory comes from nvk-macos.patch
 ln -s "$OUT/ogkm" "$S/src/nouveau/vulkan/nvkmd/nvrm/open-gpu-kernel-modules"
 python3 "$NVK/dlss/patch_dlss_cache.py" "$S"

@@ -1,5 +1,8 @@
 // channel.c: see channel.h.
 #include "channel.h"
+#include "nv_floor.h"
+#include <time.h>
+#include <unistd.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -106,6 +109,20 @@ bool chan_rewind(Chan *c)
 }
 
 void chan_done(Chan *c) { c->settled = true; }
+
+bool chan_wait_release(Chan *c, const RmMem *sem, NvU32 expected)
+{
+    struct timespec start, now;
+    NV_CLOCK_GETTIME(CLOCK_MONOTONIC, &start);
+    while (__atomic_load_n((NvU32 *)sem->cpu, __ATOMIC_ACQUIRE) != expected) {
+        NV_CLOCK_GETTIME(CLOCK_MONOTONIC, &now);
+        int64_t us = (int64_t)(now.tv_sec - start.tv_sec) * 1000000 + (now.tv_nsec - start.tv_nsec) / 1000;
+        if (us >= 1000000 || chan_error(c)) return false;
+        if (us >= 50) usleep(50);
+    }
+    chan_done(c);
+    return true;
+}
 
 NvU32 chan_gpget(Chan *c) { return ((volatile AmpereAControlGPFifo *)c->userd.cpu)->GPGet; }
 NvU32 chan_error(Chan *c) { return ((volatile NvNotification *)c->notifier.cpu)[0].status; }

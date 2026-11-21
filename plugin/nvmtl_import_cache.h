@@ -1,11 +1,7 @@
-/* nvmtl_import_cache.h - shared, short-lived imports of a surface's family VRAM.
-   CoreAnimation wraps the same few IOSurfaces in a new texture every frame. Each wrapper used to import the surface's
-   VRAM again (four resource-manager calls). Wrappers of one surface now share one import, which stays for a while after
-   the last wrapper is gone so the next frame's wrapper finds it.
-   A surface id can be reused once the surface is freed, so an entry is only used while the surface still carries the
-   cookie the import stored in it; the caller reads that cookie and passes it in.
-   Pure: no locking, no clock, no VRAM. The caller holds its own lock around every call and supplies the time, and the
-   handle is an opaque byte payload with an identity, so tools/test_import_cache.c proves every rule on the host. */
+/* Short-lived import lookup table shared by the host-pages and family-VRAM paths.
+   The caller supplies the lock, clock, handle identity and backing generation.
+   The host-pages caller leases table slots while using their buffers. The family-VRAM
+   caller leases reference-counted owners independently of their lookup slots. */
 #ifndef NVMTL_IMPORT_CACHE_H
 #define NVMTL_IMPORT_CACHE_H
 #include <stdint.h>
@@ -22,8 +18,30 @@ typedef struct {
 } nvmtl_ic_slot;
 typedef struct { nvmtl_ic_slot s[NVMTL_IC_SLOTS]; } nvmtl_ic;
 
-/* A live, unexpired entry for this surface and size whose cookie matches: its refcount goes up and its payload is copied
-   out (1). An entry whose cookie no longer matches belongs to a reused surface id: it is marked stale, so it is never
+/* Whole-card VRAM above 80%. Round the threshold down to whole bytes. */
+static inline uint64_t nvmtl_ic_pressure_excess(uint64_t used, uint64_t total)
+{
+    const uint64_t threshold = total - total / 5 - (total % 5 != 0);
+    return total && used > threshold ? used - threshold : 0;
+}
+
+/* Remove the least recently released idle entry, skipping imports still held
+   by textures. Also used by the family-VRAM cache's aggregate byte limit. */
+static inline int nvmtl_ic_evict_idle(nvmtl_ic *c, void *removed)
+{
+    int slot = -1;
+    for (int i = 0; i < NVMTL_IC_SLOTS; i++) {
+        nvmtl_ic_slot *e = &c->s[i];
+        if (e->id && !e->refs && (slot < 0 || e->idle_since < c->s[slot].idle_since)) slot = i;
+    }
+    if (slot < 0) return 0;
+    memcpy(removed, c->s[slot].payload, NVMTL_IC_PAYLOAD);
+    memset(&c->s[slot], 0, sizeof c->s[slot]);
+    return 1;
+}
+
+/* A live entry for this surface and size whose generation matches: its refcount goes up and its payload is copied
+   out (1). An entry whose generation no longer matches is marked stale, so it is never
    handed out again and goes when its last wrapper does. 0 = nothing usable. */
 static inline int nvmtl_ic_acquire(nvmtl_ic *c, uint32_t sid, size_t need, uint64_t cookie, void *payload, size_t n)
 {
@@ -38,7 +56,7 @@ static inline int nvmtl_ic_acquire(nvmtl_ic *c, uint32_t sid, size_t need, uint6
 }
 /* Adds a fresh import with one wrapper holding it. A full table gives up the idle entry unused for longest, which is
    copied to `evicted` (its id is returned through *evicted_id, non-zero) for the caller to destroy outside its lock.
-   Returns 1 when the import is cached; 0 when every slot is in use, and the caller owns the import as before. */
+   Pass NULL for `evicted` to keep all existing entries. Returns 1 when the import is cached, 0 when it is not. */
 static inline int nvmtl_ic_insert(nvmtl_ic *c, uint32_t sid, size_t need, uint64_t cookie, uintptr_t id,
                                   const void *payload, size_t n, void *evicted, uintptr_t *evicted_id)
 {
@@ -46,6 +64,7 @@ static inline int nvmtl_ic_insert(nvmtl_ic *c, uint32_t sid, size_t need, uint64
     if (!id) return 0;
     for (int i = 0; i < NVMTL_IC_SLOTS && slot < 0; i++) if (!c->s[i].id) slot = i;
     if (slot < 0) {
+        if (!evicted) return 0;
         uint64_t oldest = UINT64_MAX;
         for (int i = 0; i < NVMTL_IC_SLOTS; i++) if (!c->s[i].refs && c->s[i].idle_since < oldest) { oldest = c->s[i].idle_since; slot = i; }
         if (slot < 0) return 0;

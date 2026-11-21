@@ -1,0 +1,178 @@
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
+index 0703556..5cf0ad6 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
+@@ -278,6 +278,12 @@ VkResult nvkmd_nvrm_slot_stalled(uint32_t slot, uint32_t gen, uint64_t want, lon
+ void nvkmd_nvrm_wait_backoff(int64_t waited_ns);
+ /* b73: sleep on the first pending GRAPHICS head's completion event (<= 2 ms); falls back to the backoff */
+ void nvkmd_nvrm_wait_block(int64_t waited_ns, unsigned n, const uint32_t *slot, const uint32_t *gen, const uint64_t *want);
++struct nv_fence_trace_v1;
++VkResult nvkmd_nvrm_trace_wait_v1(VkDevice device, VkFence handle, uint64_t timeout, PFN_vkWaitForFences wait,
++                                 struct nv_fence_trace_v1 *out, size_t size);
++void nvkmd_nvrm_wait_block_observed(int64_t waited_ns, unsigned n, const uint32_t *slot,
++                                    const uint32_t *gen, const uint64_t *want, struct nv_fence_trace_v1 *trace);
++int nvrm_xnu_trace_event(int fd, uint64_t arm, uint32_t *seq, uint64_t *post_ns);
+ int64_t nvrm_xnu_wait_event(int fd, uint32_t seen, uint32_t timeout_us);
+ bool nvkmd_nvrm_defer(struct nvkmd_dev *dev, void (*fn)(void *), void *arg);
+ void nvkmd_nvrm_reap_deferred(void);
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
+index eaae2f4..96662a7 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
+@@ -1,3 +1,5 @@
++#include "nv_fence_trace.h"
++#include <time.h>
+ /*
+  * Copyright © 2024 Collabora Ltd. and Red Hat Inc.
+  * SPDX-License-Identifier: MIT
+@@ -222,6 +224,12 @@ nvrm_evwait_pending(unsigned n, const uint32_t *slot, const uint32_t *gen, const
+ }
+ void
+ nvkmd_nvrm_wait_block(int64_t waited_ns, unsigned n, const uint32_t *slot, const uint32_t *gen, const uint64_t *want)
++{
++   nvkmd_nvrm_wait_block_observed(waited_ns, n, slot, gen, want, NULL);
++}
++void
++nvkmd_nvrm_wait_block_observed(int64_t waited_ns, unsigned n, const uint32_t *slot, const uint32_t *gen,
++                               const uint64_t *want, struct nv_fence_trace_v1 *trace)
+ {
+    static int on = -1;
+    /*: the event sleep is WindowServer's (b73: polling was 35% of its active CPU). An app waiting on its own work
+@@ -243,6 +251,7 @@ nvkmd_nvrm_wait_block(int64_t waited_ns, unsigned n, const uint32_t *slot, const
+       nvkmd_nvrm_wait_backoff(waited_ns);   /* copy-engine only: no graphics event to sleep on */
+       return;
+    }
++   const int seen_fd = fd;
+    const int64_t seen = nvrm_xnu_wait_event(fd, 0, 0);   /* the count BEFORE the re-check */
+    if (seen < 0) {
+       if (on) fprintf(stderr, "nvrm: event wait OFF (the kext has no selector 6) - polling\n");
+@@ -253,7 +262,25 @@ nvkmd_nvrm_wait_block(int64_t waited_ns, unsigned n, const uint32_t *slot, const
+    { static int said; if (!said++ && nvkmd_nvrm_diag_on()) fprintf(stderr, "nvrm: event wait ON - waits sleep on graphics completion events (fd %d)\n", fd); }
+    if (!nvrm_evwait_pending(n, slot, gen, want, &fd) || fd < 0)
+       return;
+-   (void)nvrm_xnu_wait_event(fd, (uint32_t)seen, 2000);
++   if (!trace || fd != seen_fd) { (void)nvrm_xnu_wait_event(fd, (uint32_t)seen, 2000); return; }
++   uint32_t post_seq = 0; uint64_t post_ns = 0;
++   bool armed = trace->kernel_status >= 0 && nvrm_xnu_trace_event(fd, 1, &post_seq, &post_ns);
++   trace->kernel_status = armed ? 1 : -1;
++   trace->event_calls++;
++   trace->event_seen = (uint32_t)seen;
++   trace->event_enter_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++   trace->event_returned = nvrm_xnu_wait_event(fd, (uint32_t)seen, 2000);
++   trace->event_return_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++   bool snapshot = armed && nvrm_xnu_trace_event(fd, 0, &post_seq, &post_ns);
++   trace->shared_post_ns = 0;
++   trace->shared_post_valid = 0;
++   if (trace->event_returned >= 0 && (uint32_t)trace->event_returned != (uint32_t)seen) {
++      trace->changed_calls++;
++      if (snapshot && post_ns && post_seq == (uint32_t)trace->event_returned) {
++         trace->shared_post_ns = post_ns;
++         trace->shared_post_valid = 1;
++      }
++   }
+ }
+ 
+ /* b73 (patch_evflush.py): the synchronous flush's sleep. true = slept on the device's graphics completion event, or
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_sync.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_sync.c
+index 7322b4c..92452b4 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_sync.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_sync.c
+@@ -1,3 +1,6 @@
++#include "vk_fence.h"
++#include "nv_fence_trace.h"
++#include <time.h>
+ #include "nvkmd_nvrm.h"
+ 
+ #include <poll.h>
+@@ -348,6 +351,27 @@ nvrm_gsub_sync_move(struct vk_device *device, struct vk_sync *dst, struct vk_syn
+    return VK_SUCCESS;
+ }
+ 
++// Only the active vk_sync of the exact VkFence passed here can publish into this
++// record. Nested waits on other syncs, multi-waits and poll-only status queries
++// cannot be mistaken for the single-fence observation.
++static _Thread_local struct vk_sync *trace_sync;
++static _Thread_local struct nv_fence_trace_v1 *trace_result;
++
++__attribute__((visibility("default"))) VkResult
++nvkmd_nvrm_trace_wait_v1(VkDevice device, VkFence handle, uint64_t timeout, PFN_vkWaitForFences wait,
++                         struct nv_fence_trace_v1 *out, size_t size)
++{
++   if (!out || size != sizeof(*out)) return wait(device, 1, &handle, VK_TRUE, timeout);
++   struct vk_sync *prior_sync = trace_sync;
++   struct nv_fence_trace_v1 *prior_result = trace_result;
++   trace_sync = vk_fence_get_active_sync(vk_fence_from_handle(handle));
++   trace_result = out;
++   VkResult r = wait(device, 1, &handle, VK_TRUE, timeout);
++   trace_sync = prior_sync;
++   trace_result = prior_result;
++   return r;
++}
++
+ /* The wait: each pass reaps every sync under the lock and sums the semaphores of the channels it still needs.
+  * A changed error notifier = DEVICE_LOST at once; those semaphores standing still for NVRM_FLUSH_TIMEOUT_MS =
+  * DEVICE_LOST with the old diagnostic; a wait on a CPU signal or an unsubmitted value has only abs_timeout. */
+@@ -356,6 +380,8 @@ nvrm_gsub_wait(uint32_t n, const struct vk_sync_wait *waits, enum vk_sync_wait_f
+                uint64_t abs_timeout_ns, struct vk_object_base *log_obj)
+ {
+    const bool any = flags & VK_SYNC_WAIT_ANY, pending = flags & VK_SYNC_WAIT_PENDING;
++   struct nv_fence_trace_v1 *trace = n == 1 && !pending && trace_sync == waits[0].sync ? trace_result : NULL;
++   if (trace) trace->matched = 1;
+    const int64_t t0 = os_time_get_nano(), budget = nvkmd_nvrm_flush_timeout_ms() * 1000000LL;
+    int64_t tp = t0;
+    uint64_t lastSum = 0;
+@@ -372,6 +398,15 @@ nvrm_gsub_wait(uint32_t n, const struct vk_sync_wait *waits, enum vk_sync_wait_f
+             continue;
+          }
+          const uint64_t want = nvrm_gsub_is_binary(s) ? 1 : waits[i].wait_value;
++         // reap removes completed targets, so copy the identity under the same lock first.
++         // A fence that another thread already reaped may have no identifiable channel.
++         if (trace && nvrm_gsub_is_binary(s) && s->value < want && s->npend == 1 && s->pend[0].value >= want) {
++            const struct nvkmd_nvrm_sync_pend *p = &s->pend[0];
++            if (trace->target_valid && (trace->slot != p->slot || trace->gen != p->gen || trace->target != p->seq))
++               trace->ambiguous_target = 1;
++            trace->slot = p->slot; trace->gen = p->gen; trace->target = p->seq;
++            trace->target_valid = !trace->ambiguous_target;
++         }
+          nvrm_gsub_reap(s);
+          if ((pending ? s->pending : s->value) >= want) {
+             done++;
+@@ -398,7 +433,9 @@ nvrm_gsub_wait(uint32_t n, const struct vk_sync_wait *waits, enum vk_sync_wait_f
+       }
+       pthread_mutex_unlock(&nvkmd_nvrm_gsub_mtx);
+       if (any ? (done > 0 || n == 0) : done == n) {
++         if (trace) trace->ready_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+          nvkmd_nvrm_reap_deferred();
++         if (trace) trace->reap_done_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+          return VK_SUCCESS;
+       }
+       const int64_t t = os_time_get_nano();
+@@ -427,7 +464,7 @@ nvrm_gsub_wait(uint32_t n, const struct vk_sync_wait *waits, enum vk_sync_wait_f
+             return r;
+          tp = t;
+       }
+-      nvkmd_nvrm_wait_block(t - t0, nh, hslot, hgen, hseq);   /* b73 */
++      nvkmd_nvrm_wait_block_observed(t - t0, nh, hslot, hgen, hseq, trace);
+    }
+ }
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.c b/src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.c
+index b066bf9..63ca196 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.c
+@@ -178,6 +178,15 @@ int nvrm_xnu_open(const char *node)
+ static io_connect_t conn_of(int fd) { return (fd >= 0 && fd < NVRM_XNU_MAX_FD) ? gConn[fd] : 0; }
+ /* b73: sleep until this connection's RM event count moves past `seen` (kext NVRMUserClient selector 6), at most
+  * timeout_us (0 = just read the count). Returns the count now, or -1 when the kext has no selector 6 (pre-b73). */
++int nvrm_xnu_trace_event(int fd, uint64_t arm, uint32_t *seq, uint64_t *post_ns);
++int nvrm_xnu_trace_event(int fd, uint64_t arm, uint32_t *seq, uint64_t *post_ns)
++{
++    io_connect_t conn = conn_of(fd);
++    if (!conn) return 0;
++    uint64_t out[2] = {0}; uint32_t n = 2;
++    if (IOConnectCallScalarMethod(conn, 9, &arm, 1, out, &n) != KERN_SUCCESS || n != 2) return 0;
++    *seq = (uint32_t)out[0]; *post_ns = out[1]; return 1;
++}
+ int64_t nvrm_xnu_wait_event(int fd, uint32_t seen, uint32_t timeout_us)
+ {
+     io_connect_t conn = conn_of(fd); if (!conn) return -1;

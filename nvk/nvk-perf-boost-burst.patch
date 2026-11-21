@@ -1,15 +1,27 @@
 diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
-index 27770bc..6c9cf32 100644
+index 27770bc..0703556 100644
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
-@@ -44,12 +44,27 @@ struct nvkmd_nvrm_pdev {
+@@ -13,6 +13,7 @@
+ 
+ #include <sys/types.h>
+ #include <pthread.h>
++#include <stdatomic.h>
+ #include <stdbool.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -44,12 +45,33 @@ struct nvkmd_nvrm_pdev {
     struct NV2080_CTRL_FB_GET_SEMAPHORE_SURFACE_LAYOUT_PARAMS semSurfLayout;
     uint32_t channelClass;
  
-+   /* Performance boost policy (see nvkmd_nvrm_boost_burst): the mode is fixed when the device is created,
-+    * boostRenewNs is the monotonic time before which a submit does not ask again. */
-+   int boostMode;
-+   uint64_t boostRenewNs;
++   /* Performance boost policy (see nvkmd_nvrm_boost_burst). The renewal timer owns boostRenewNs; it renews while a
++    * lease is live, so no submit pays the GSP round trip. boostThread is the renewal timer (joined by pdev_destroy),
++    * boostInFlight counts a refresh between its mode check and its nvRmApiControl return, so destroy waits for it. */
++   _Atomic int boostMode;
++   _Atomic uint64_t boostRenewNs;
++   _Atomic int boostInFlight;
++   thrd_t boostThread;
++   bool boostThreadCreated;
 +
     uint32_t numClasses;
     uint32_t *classList;
@@ -24,13 +36,15 @@ index 27770bc..6c9cf32 100644
 +   NVKMD_NVRM_BOOST_HOLD,    /* NVRM_610_BOOST=hold: one boost for the life of the device (compute-style) */
 +};
 +
-+/* Called on every command submission; asks for full clocks at most once a second and only while work is flowing. */
++/* Called on every command submission; asks for full clocks at most once a renewal interval and only while work is
++ * flowing. The renewal timer calls nvkmd_nvrm_boost_refresh directly, so a submit never pays the GSP round trip. */
 +void nvkmd_nvrm_boost_burst(struct nvkmd_nvrm_pdev *pdev);
++void nvkmd_nvrm_boost_refresh(struct nvkmd_nvrm_pdev *pdev);
 +
  VkResult nvkmd_nvrm_try_create_pdev(struct _drmDevice *drm_device,
                                         struct vk_object_base *log_obj,
                                         enum nvk_debug debug_flags,
-@@ -270,8 +285,8 @@ VkResult nvkmd_nvrm_sync_cpu_wait(struct vk_sync *sync, uint64_t wait_value,
+@@ -270,8 +292,8 @@ VkResult nvkmd_nvrm_sync_cpu_wait(struct vk_sync *sync, uint64_t wait_value,
  
  
  /* b81: NVRM_610_<ITEM>=0 turns one recipe item back to the b80 shape (TSG PREEMPT LGPROMO ZCULL USERMODE BOOST CECHAN) */
@@ -41,7 +55,7 @@ index 27770bc..6c9cf32 100644
  {
     char k[64];
     snprintf(k, sizeof k, "NVRM_610_%s", item);
-@@ -291,10 +306,16 @@ nvrm610_on(const char *item)
+@@ -291,10 +313,16 @@ nvrm610_on(const char *item)
        if (hit && (hit == conf || hit[-1] == '\n')) {
           char v = hit[strlen(key)];
           fprintf(stderr, "nvrm: 610 %s=%c (nvrm610.conf)\n", item, v);
@@ -61,31 +75,32 @@ index 27770bc..6c9cf32 100644
  
  static inline void
 diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
-index e297f19..1bab1db 100644
+index a922be4..a199305 100644
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
-@@ -1168,6 +1168,8 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+@@ -1152,6 +1152,8 @@ nvkmd_nvrm_exec_ctx_destroy(struct nvkmd_ctx *_ctx)
     struct NvRmApi rm;
     nvkmd_nvrm_dev_api_ctl(pdev, &rm);
  
 +   nvkmd_nvrm_boost_burst(pdev);   /* full clocks while work is being submitted, idle clocks when it stops */
 +
-    NvNotification *notifiers = ctx->notifier->map;
-    NvNotification *submitTokenNotifier = &notifiers[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_WORK_SUBMIT_TOKEN];
-    KeplerBControlGPFifo *userD = ctx->userD->map;
+    nvrm_gsub_unregister(ctx);   // G-SUB (b79): idle, then retire the channel slot and run what it deferred
+    nvRmApiFree(&rm, ctx->hEvent);
+    if (ctx->osEvent >= 0)
 diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_pdev.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_pdev.c
-index df70c2c..6a6e53b 100644
+index df70c2c..a3d6011 100644
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_pdev.c
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_pdev.c
-@@ -10,6 +10,7 @@
+@@ -10,6 +10,8 @@
  #include <stdlib.h>
  
  #include "util/os_misc.h"
 +#include "util/os_time.h"
++#include "util/u_thread.h"
  #include "util/u_memory.h"
  #include "vk_log.h"
  
-@@ -643,17 +644,25 @@ nvkmd_nvrm_create_pdev(struct vk_object_base *log_obj,
+@@ -643,17 +645,32 @@ nvkmd_nvrm_create_pdev(struct vk_object_base *log_obj,
     assert(os_page_size <= UINT32_MAX);
     pdev->base.bind_align_B = os_page_size;
  
@@ -113,33 +128,64 @@ index df70c2c..6a6e53b 100644
        if (nvkmd_nvrm_diag_on()) fprintf(stderr, "nvrm: PERF_BOOST flags 0x%x INFINITE rc 0x%x\n", (unsigned)bp.flags, (unsigned)bs);
 +   } else if (nvkmd_nvrm_diag_on()) {
 +      fprintf(stderr, "nvrm: PERF_BOOST %s\n", pdev->boostMode == NVKMD_NVRM_BOOST_BURST ? "per burst of work" : "off");
++   }
++
++   /* The lease is renewed by its own timer, not by submissions: a submit never pays the GSP round trip, and a pause
++    * between frames no longer drops the clocks. pdev_destroy joins the thread, so it is not detached. */
++   if (pdev->boostMode == NVKMD_NVRM_BOOST_BURST) {
++      if (thrd_create(&pdev->boostThread, nvkmd_nvrm_boost_thread, pdev) == thrd_success)
++         pdev->boostThreadCreated = true;
     }
  
     /* b72 host-pointer import PROBE: pin ONE page as OS-descriptor memory. VK_EXT_external_memory_host is advertised
-@@ -753,6 +762,42 @@ done:
+@@ -753,6 +770,74 @@ done:
     return result;
  }
  
-+/* How long one lease lasts, and how often a busy process renews it. The lease outlives the renewal interval, so
-+ * it never lapses while submissions keep coming; a process that stops submitting falls out of boost within
-+ * NVKMD_NVRM_BOOST_LEASE_S seconds and the GPU can drop to its idle state. */
-+#define NVKMD_NVRM_BOOST_LEASE_S   3
-+#define NVKMD_NVRM_BOOST_RENEW_NS  1000000000ull
++/* How long one lease lasts, and how often the renewal timer extends it while a client keeps working. The lease
++ * outlives several renewal intervals, so it does not lapse while work flows; a process that stops submitting falls
++ * out of boost within NVKMD_NVRM_BOOST_LEASE_S seconds and the GPU can drop to its idle state. The lease used to
++ * be 3 s renewed once a second from inside the submit path: every renewal was a GSP round trip under the caller's
++ * submit lock, and a pause of one second between submits dropped the clocks mid-session. */
++#define NVKMD_NVRM_BOOST_LEASE_S   30
++#define NVKMD_NVRM_BOOST_RENEW_S   5
 +
-+void
-+nvkmd_nvrm_boost_burst(struct nvkmd_nvrm_pdev *pdev)
++/* Renews the lease from its own thread, so the submit path never carries the GSP round trip. Wakes four times a
++ * second; a wake that finds the lease current costs one clock read. It leaves when the mode is no longer BURST, and
++ * nvkmd_nvrm_pdev_destroy joins it, so it cannot outlive the device it renews for. */
++static int
++nvkmd_nvrm_boost_thread(void *arg)
 +{
-+   if (pdev->boostMode != NVKMD_NVRM_BOOST_BURST)
++   struct nvkmd_nvrm_pdev *pdev = arg;
++   while (atomic_load_explicit(&pdev->boostMode, memory_order_relaxed) == NVKMD_NVRM_BOOST_BURST) {
++      nvkmd_nvrm_boost_refresh(pdev);
++      struct timespec ts = { .tv_sec = 0, .tv_nsec = 250 * 1000 * 1000 };
++      thrd_sleep(&ts, NULL);
++   }
++   return 0;
++}
++
++/* One renewal if the lease is due. Runs on the renewal timer and, as a fallback for a device whose timer has not
++ * started, on the submitting thread; the CAS makes concurrent callers agree on one winner. boostInFlight covers the
++ * window from the mode check to the nvRmApiControl return, so destroy can wait for a refresh to finish before it
++ * frees the subdevice the refresh talks to. */
++void
++nvkmd_nvrm_boost_refresh(struct nvkmd_nvrm_pdev *pdev)
++{
++   if (atomic_load_explicit(&pdev->boostMode, memory_order_relaxed) != NVKMD_NVRM_BOOST_BURST)
 +      return;
 +
 +   const uint64_t now = os_time_get_nano();
-+   uint64_t due = __atomic_load_n(&pdev->boostRenewNs, __ATOMIC_RELAXED);
++   uint64_t due = atomic_load_explicit(&pdev->boostRenewNs, memory_order_relaxed);
 +   if (now < due)
 +      return;
++   atomic_fetch_add_explicit(&pdev->boostInFlight, 1, memory_order_acquire);
 +   /* One thread wins the renewal; the others see the new deadline and go on. */
-+   if (!__atomic_compare_exchange_n(&pdev->boostRenewNs, &due, now + NVKMD_NVRM_BOOST_RENEW_NS, false,
-+                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED))
++   if (!atomic_compare_exchange_strong_explicit(&pdev->boostRenewNs, &due, now + NVKMD_NVRM_BOOST_RENEW_S * 1000000000ull,
++                                                memory_order_relaxed, memory_order_relaxed)) {
++      atomic_fetch_sub_explicit(&pdev->boostInFlight, 1, memory_order_release);
 +      return;
++   }
 +
 +   struct NvRmApi rm;
 +   nvkmd_nvrm_dev_api_ctl(pdev, &rm);
@@ -148,23 +194,42 @@ index df70c2c..6a6e53b 100644
 +      .duration = NVKMD_NVRM_BOOST_LEASE_S,
 +   };
 +   NV_STATUS bs = nvRmApiControl(&rm, pdev->hSubdevice, NV2080_CTRL_CMD_PERF_BOOST, &bp, sizeof bp);
++   atomic_fetch_sub_explicit(&pdev->boostInFlight, 1, memory_order_release);
 +   if (bs != NV_OK) {
-+      /* Not supported here: stop asking rather than fail every second. */
-+      __atomic_store_n(&pdev->boostMode, NVKMD_NVRM_BOOST_OFF, __ATOMIC_RELAXED);
++      /* Not supported here: stop asking rather than fail on every renewal. */
++      atomic_store_explicit(&pdev->boostMode, NVKMD_NVRM_BOOST_OFF, memory_order_relaxed);
 +      if (nvkmd_nvrm_diag_on())
 +         fprintf(stderr, "nvrm: PERF_BOOST lease refused (rc 0x%x), not asking again\n", (unsigned)bs);
 +   }
 +}
 +
++/* The submit-path entry: the timer has normally renewed already, so this is a clock read and a return. */
++void
++nvkmd_nvrm_boost_burst(struct nvkmd_nvrm_pdev *pdev)
++{
++   nvkmd_nvrm_boost_refresh(pdev);
++}
++
  static void
  nvkmd_nvrm_pdev_destroy(struct nvkmd_pdev *_pdev)
  {
-@@ -762,7 +807,7 @@ nvkmd_nvrm_pdev_destroy(struct nvkmd_pdev *_pdev)
+@@ -762,7 +847,18 @@ nvkmd_nvrm_pdev_destroy(struct nvkmd_pdev *_pdev)
  	   struct NvRmApi rm;
  	   nvkmd_nvrm_dev_api_ctl(pdev, &rm);
  
 -	   if (nvrm610_on("BOOST")) {   /* b81: CLEAR the context-life boost (CUDA's teardown shape) */
-+	   if (pdev->boostMode != NVKMD_NVRM_BOOST_OFF) {   /* drop any boost still leased or held */
++	   /* Stop the renewal timer first and wait for it: if a refresh already passed its mode check and is between
++	    * that check and its nvRmApiControl, joining and the in-flight wait below let it finish against a live
++	    * subdevice. The join costs at most the thread's 250 ms sleep, which is fine once, at teardown. */
++	   const bool wasBoosted = atomic_load_explicit(&pdev->boostMode, memory_order_relaxed) != NVKMD_NVRM_BOOST_OFF;
++	   atomic_store_explicit(&pdev->boostMode, NVKMD_NVRM_BOOST_OFF, memory_order_relaxed);
++	   if (pdev->boostThreadCreated)
++	      thrd_join(pdev->boostThread, NULL);
++	   /* Belt and braces: a submit-path refresh may still be in flight (no timer thread, or a won CAS before the
++	    * store). A refresh is one bounded ioctl, so this waits no longer than that. */
++	   while (atomic_load_explicit(&pdev->boostInFlight, memory_order_acquire) != 0)
++	      usleep(100);
++	   if (wasBoosted) {   /* drop any boost still leased or held */
  	      NV2080_CTRL_PERF_BOOST_PARAMS bp = { .flags = NV2080_CTRL_PERF_BOOST_FLAGS_CMD_CLEAR, .duration = 0 };
  	      nvRmApiControl(&rm, pdev->hSubdevice, NV2080_CTRL_CMD_PERF_BOOST, &bp, sizeof bp);
  	   }

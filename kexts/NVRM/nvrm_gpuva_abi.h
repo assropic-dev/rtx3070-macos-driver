@@ -27,6 +27,8 @@ struct NVRMDisplayPointers {
 #define NVRM_FLIP_ABI_VERSION 2u
 
 #define NVRM_FLIP_FN  "nvFlipToSurface"
+#define NVRM_FLIP_L10R_FN "nvFlipL10RSurfacePure"
+#define NVRM_FLIP_L10R_PROPERTY "NVRMDirectL10R"
 
 struct NVRMFlipRequest {
     unsigned int version;

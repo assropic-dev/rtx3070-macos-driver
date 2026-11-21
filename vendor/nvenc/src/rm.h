@@ -54,6 +54,8 @@ typedef struct {
 } RmMem;
 NV_STATUS rm_va_init(Rm *rm);                                            // FERMI_VASPACE_A for our objects
 NV_STATUS rm_mem_alloc(Rm *rm, RmMem *m, NvU64 size, NvU64 align, bool sysmem, bool cpuMap, bool gpuMap);
+// Import a share granted to this client, and map it in this GPU address space.
+NV_STATUS rm_mem_dup(Rm *rm, RmMem *m, NvHandle client, NvHandle memory, NvU64 bytes);
 void rm_mem_free(Rm *rm, RmMem *m);
 // CPU-map any RM object that supports it (memory, usermode doorbell page) through a fresh connection
 NV_STATUS rm_map_cpu(Rm *rm, NvHandle parent, NvHandle obj, NvU64 size, bool sysmem, RmConn *conn, void **cpu);

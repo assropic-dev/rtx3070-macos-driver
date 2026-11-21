@@ -75,6 +75,7 @@ public:
     // before trusting the family bit, so VRAM re-allocated under the same resource counts as unwritten again (a parked
     // allocation that comes back keeps its cookie, and so its record). 0 = never written.
     unsigned long long fPluginWroteCookie = 0;
+    unsigned long long fVideoCookie = 0;
 };
 OSDefineMetaClassAndStructors(NVResource, IOAccelResource2)
 class NVSysMemory : public IOAccelSysMemory {

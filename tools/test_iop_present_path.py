@@ -24,6 +24,7 @@ async_region = source[a0:a1]
 h0 = source.index('static void nvAccelIopHome(IOService *fb, unsigned head)\n{')
 h1 = source.index('\n}\n', h0) + 3
 home_region = source[h0:h1]
+pending_region = source[source.index('static int gSurfGpuOn = 1;'):source.index('// True when a GPU write to this surface')]
 
 HOME_BUSY = '    if (rr == kIOReturnBusy) return;\n'
 assert home_region.count(HOME_BUSY) == 1
@@ -57,7 +58,6 @@ struct IOService : OSObject {
     bool metaCast(const char *) { return true; }
 };
 struct IOSurface : OSObject { unsigned id = 0; unsigned getSurfaceID() const { return id; } };
-static bool nvSurfWaitReady(unsigned) { return true; }
 static const unsigned kNvMaxFB = 5;
 static IOSurface *gIopFlipFront[kNvMaxFB], *gIopFlipPrev[kNvMaxFB];
 static bool gIopFlipped[kNvMaxFB];
@@ -76,8 +76,21 @@ static IOLock *IOLockAlloc() { return &gL; } static void IOLockFree(IOLock *) {}
 static bool OSCompareAndSwapPtr(void *o, void *n, void *volatile *p) { if (*p != o) return false; *p = n; return true; }
 static void IOLockLock(IOLock *l) { assert(!l->held); l->held = 1; } static void IOLockUnlock(IOLock *l) { assert(l->held); l->held = 0; }
 static void IOLockWakeup(IOLock *l, event_t, bool) { assert(l->held); }
-static int IOLockSleepDeadline(IOLock *l, event_t, uint64_t deadline, int) { assert(l->held); if ((int64_t)deadline > gClock) gClock = (int64_t)deadline; return 0; }
+static void (*beforeWaiterRelocks)();
+static int IOLockSleepDeadline(IOLock *l, event_t, uint64_t deadline, int) {
+    assert(l->held);
+    if ((int64_t)deadline > gClock) gClock = (int64_t)deadline;
+    if (beforeWaiterRelocks) {
+        IOLockUnlock(l);
+        auto callback = beforeWaiterRelocks; beforeWaiterRelocks = nullptr;
+        callback();
+        IOLockLock(l);
+    }
+    return 0;
+}
 static int gSignals = 0;
+static void absolutetime_to_nanoseconds(uint64_t ticks, uint64_t *ns) { *ns = ticks; }
+@@PENDING@@
 extern "C" void _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(void *, void *) { gSignals++; }
 struct thread_call { void (*fn)(void *, void *); void *p; int pending; };
 static thread_call gCall;
@@ -90,7 +103,7 @@ static NVRMFlipRequest req() { NVRMFlipRequest f; nvSVZero(&f, sizeof f); f.vers
 int main() {
     IOService fb; fb.period.v = 7570;   // 165 Hz: one period and a quarter
     int pipe = 0, otherPipe = 0;
-    IOSurface A, B, C, D, E; A.id = 1; B.id = 2; C.id = 3; D.id = 4; E.id = 5;
+    IOSurface A, B, C, D, E, F; A.id = 1; B.id = 2; C.id = 3; D.id = 4; E.id = 5; F.id = 6;
     NVRMFlipRequest f = req();
     // A flip on the panel completes its transaction once; the head is free afterwards.
     assert(nvAccelIopAsyncStart(&pipe, &fb, 0, &A, &f));
@@ -120,6 +133,27 @@ int main() {
     assert(gCntIopLate == 1 && gCntIopAsyncRefused == 0 && gIopAsync == 1 && E.rc == 1 && gIopFlipFront[0] == &D);
     assert(gSignals == signals0 + 3 && !nvAccelIopAsyncBusy(&pipe) && "a kept frame still completes its transaction");
     fb.answer = kIOReturnSuccess;
+    // A producer timeout keeps the last completed surface; a queued ready frame can still land.
+    { const int calls = fb.calls, signals = gSignals; const SInt64 late = gCntIopLate;
+      nvSurfMark(E.id, true);
+      assert(nvAccelIopAsyncStart(&pipe, &fb, 0, &E, &f));
+      runWorker();
+      assert(fb.calls == calls && gIopFlipFront[0] == &D && gIopFlipPrev[0] == &B);
+      assert(gSignals == signals + 1 && gCntIopLate == late + 1 && E.rc == 1 && !nvAccelIopAsyncBusy(&pipe));
+      assert(nvAccelIopAsyncStart(&pipe, &fb, 0, &E, &f));
+      assert(nvAccelIopAsyncStart(&pipe, &fb, 0, &F, &f));
+      runWorker();
+      assert(gSignals == signals + 3 && fb.calls == calls + 1 && gIopFlipFront[0] == &F);
+      assert(gCntSurfTimeouts == 1 && "the timed-out write stays pending without sleeping through another deadline");
+      nvSurfMark(E.id, false);
+      assert(nvSurfWaitReady(E.id) && "a genuine completion permits this surface to be reused again"); }
+    // A writer completes and the surface is marked again while an older wait is reacquiring the lock.
+    // The old present keeps the front buffer at its deadline. A new present can wait for its own writer.
+    nvSurfMark(E.id, true);
+    beforeWaiterRelocks = [] { nvSurfMark(5, false); nvSurfMark(5, true); };
+    assert(!nvSurfWaitReady(E.id));
+    beforeWaiterRelocks = [] { nvSurfMark(5, false); };
+    assert(nvSurfWaitReady(E.id) && "an old wait poisoned a newer generation");
     // A frame answered NotReady (display asleep, GPU in standby): completed, not a refusal and not counted late (#470).
     { const SInt64 lateBefore = gCntIopLate; const int signalsBefore = gSignals;
       fb.answer = kIOReturnNotReady;
@@ -150,7 +184,7 @@ int main() {
 def build_and_run(async_text, home_text):
     with tempfile.TemporaryDirectory() as d:
         cpp = pathlib.Path(d) / 'tc.cpp'; binp = pathlib.Path(d) / 'tc'
-        cpp.write_text(fixture.replace('@@ASYNC@@', async_text).replace('@@HOME@@', home_text))
+        cpp.write_text(fixture.replace('@@ASYNC@@', async_text).replace('@@HOME@@', home_text).replace('@@PENDING@@', pending_region))
         subprocess.run(['c++', '-std=c++17', '-O0', '-Wno-everything', str(cpp), '-o', str(binp)], check=True)
         return subprocess.run([str(binp)], capture_output=True, text=True)
 

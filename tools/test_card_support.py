@@ -97,8 +97,8 @@ static const char *fixture_program(void) { return program; }
 #define getprogname fixture_program
 #define MTLCommandBufferStatusError 5
 // an NVAccel without frame marks: WindowServer keeps its own wait for each composite
-static BOOL nvmtl_ws_kernel_waits(void) { return NO; }
-@interface Command : NSObject
+static BOOL frameMarks;
+@interface Command : NSObject { BOOL _wsWaitForCompletion; }
 @property int status;
 @property int completed, scheduled, commits;
 - (void)commit;
@@ -107,7 +107,7 @@ static BOOL nvmtl_ws_kernel_waits(void) { return NO; }
 - (BOOL)commitAndWaitUntilSubmitted;
 @end
 @implementation Command
-- (void)commit { self.commits++; }
+- (void)commit { self.commits++; _wsWaitForCompletion = !frameMarks; frameMarks = !frameMarks; }
 - (void)waitUntilCompleted { self.completed++; }
 - (void)waitUntilScheduled { self.scheduled++; }
 PRODUCTION
@@ -118,6 +118,8 @@ int main(int argc,char **argv) { @autoreleasepool {
  Command *cb=[Command new];
  if (![cb commitAndWaitUntilSubmitted] || cb.commits!=1 ||
      cb.completed!=(ws?1:0) || cb.scheduled!=(ws?0:1)) return 42;
+ if (![cb commitAndWaitUntilSubmitted] || cb.commits!=2 ||
+     cb.completed!=(ws?1:0) || cb.scheduled!=(ws?1:2)) return 44;
  cb.status=MTLCommandBufferStatusError;
  if ([cb commitAndWaitUntilSubmitted]) return 43;
  puts("PASS display completion ordering and error return");

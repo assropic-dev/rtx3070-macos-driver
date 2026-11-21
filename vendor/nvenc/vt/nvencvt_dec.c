@@ -6,6 +6,7 @@
 // Registered by NVEncVT_Register next to the encoders (NVENCVT_NO_DEC=1 leaves it out), so every way the encoder gets
 // into a process (NullMoth's NVMTL_NVENCVT hook, nvenc-run) brings the decoder too.
 #include "nvencvt_diag.h"
+#include "nvencvt_surface.h"
 #include "dec.h"
 #include "nv_floor.h"
 #include "vp9dec.h"
@@ -71,6 +72,7 @@ static bool gDLog; static FILE *gDLogF;
 
 typedef struct {
     pthread_mutex_t lock;
+    unsigned gpuFrames, stagedFrames;
     VTVideoDecoderSession session;
     CMVideoFormatDescriptionRef fmt;
     FourCharCode codec;
@@ -147,7 +149,12 @@ static int open_av1(DState *s, unsigned w, unsigned h, int depth)
     pthread_mutex_unlock(&gParkLock);
     if (pd) { s->vrm = prm; s->av1 = pd; DLOG("startSession: took over the previous session's stream"); return 0; }
     Rm *rm = calloc(1, sizeof *rm); Av1Dec *d = calloc(1, sizeof *d);
-    if (!rm || !d || rm_open(rm) || rm_va_init(rm) || av1dec_open(d, rm, w, h, depth)) { free(d); if (rm) { rm_close(rm); free(rm); } return -1; }
+    if (!rm || !d || rm_open(rm) || rm_va_init(rm) || av1dec_open(d, rm, w, h, depth)) {
+        if (d && d->rm) av1dec_close(d);
+        free(d);
+        if (rm) { rm_close(rm); free(rm); }
+        return -1;
+    }
     s->vrm = rm; s->av1 = d;
     return 0;
 }
@@ -164,7 +171,10 @@ static int open_vp9(DState *s, unsigned w, unsigned h, int depth)
     Vp9Dec *d = calloc(1, sizeof *d);
     if (!rm || !d || (!prm && (rm_open(rm) || rm_va_init(rm))) ||
         vp9dec_open(d, rm, pd && pd->maxW > w ? pd->maxW : w, pd && pd->maxH > h ? pd->maxH : h, depth)) {
-        free(d); if (pd) { vp9dec_close(pd); free(pd); } if (rm) { rm_close(rm); free(rm); }
+        if (d && d->rm) vp9dec_close(d);
+        free(d);
+        if (pd) { vp9dec_close(pd); free(pd); }
+        if (rm) { rm_close(rm); free(rm); }
         return -1;
     }
     if (pd) { vp9dec_migrate(d, pd); vp9dec_close(pd); free(pd); DLOG("startSession: took over the previous session's stream (grown)"); }
@@ -198,7 +208,7 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
     if (s->colour) { CFRelease(s->colour); s->colour = NULL; }
     if (s->frames) DLOG("per frame: decodeFrame %.2f ms (engine %.2f, pool %.2f, copy %.2f, emit %.2f), outside %.2f ms",
          s->tIn / s->frames, s->tEngine / s->frames, s->tPool / s->frames, s->tCopy / s->frames, s->tEmit / s->frames, s->tOut / s->frames);
-    DLOG("invalidate after %u frames, %u errors", s->frames, s->errors);
+    DLOG("invalidate after %u frames, %u errors, %u published in VRAM, %u CE readbacks", s->frames, s->errors, s->gpuFrames, s->stagedFrames);
     pthread_mutex_unlock(&s->lock);
     return noErr;
 }
@@ -568,16 +578,39 @@ static void out_copy(DState *s, OutJob *j)
     if (!j->pb || j->surf < 0 || j->res) return;
     const double tc = nowms();
     CVPixelBufferRef pb = j->pb;
-    CVPixelBufferLockBaseAddress(pb, 0);
+    DecCopy *copy = NULL;
+    const RmMem *yp = NULL, *uvp = NULL;
+    size_t pitch = 0;
+    unsigned bps = 0;
+    if (s->codec == CODEC_AV1 || s->codec == CODEC_VP9) {
+        if (s->codec == CODEC_AV1) {
+            Av1Dec *d = s->av1; copy = &d->copy; yp = &d->luma[j->surf]; uvp = &d->chroma[j->surf]; pitch = d->pitch; bps = d->bps;
+        } else {
+            Vp9Dec *d = s->vp9; copy = &d->copy; yp = &d->luma[j->surf]; uvp = &d->chroma[j->surf]; pitch = d->pitch; bps = d->bps;
+        }
+        if (nvdec_output_vram(copy, pb, pitch, yp, uvp, bps, j->w, j->h)) {
+            s->gpuFrames++;
+            goto output_ready;
+        }
+    }
+    if (CVPixelBufferLockBaseAddress(pb, 0) != kCVReturnSuccess) { j->res = kVTVideoDecoderMalfunctionErr; return; }
     uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0), *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
     const size_t ys = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), uvs = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
-    if (s->codec == CODEC_VP9) vp9dec_read_nv12(s->vp9, j->surf, y, ys, uv, uvs, j->w, j->h);
+    if (!y || !uv) j->res = kVTVideoDecoderMalfunctionErr;
+    else if (copy && (j->h > CVPixelBufferGetHeightOfPlane(pb, 0) ||
+                      ((size_t)j->h + 1) / 2 > CVPixelBufferGetHeightOfPlane(pb, 1) ||
+                      (size_t)j->w * bps > ys || ((j->w + 1ULL) & ~1ULL) * bps > uvs))
+        j->res = kVTVideoDecoderMalfunctionErr;
+    else if (copy && nvdec_output_readback(copy, pb, pitch, yp, uvp, bps, j->w, j->h))
+        s->stagedFrames++;
+    else if (s->codec == CODEC_VP9) vp9dec_read_nv12(s->vp9, j->surf, y, ys, uv, uvs, j->w, j->h);
     else if (s->codec == CODEC_AV1) av1dec_read_nv12(s->av1, j->surf, y, ys, uv, uvs, j->w, j->h);
     else if (s->codec == kCMVideoCodecType_HEVC) hevcdec_read_nv12(s->hevc, j->surf, y, ys, uv, uvs, j->w, j->h, j->cx, j->cy);
     else if (is_mpeg12(s->codec)) mpeg2dec_read_nv12(s->m2, j->surf, y, ys, uv, uvs, j->w, j->h);
     else if (s->codec == kCMVideoCodecType_MPEG4Video) mpeg4dec_read_nv12(s->m4, j->surf, y, ys, uv, uvs, j->w, j->h);
     else h264dec_read_nv12(&s->dec, j->surf, y, ys, uv, uvs, j->w, j->h);
     CVPixelBufferUnlockBaseAddress(pb, 0);
+output_ready:
     if (s->colour && !getenv("NVDEC_NOCOLOUR")) CVBufferSetAttachments(pb, s->colour, kCVAttachmentMode_ShouldPropagate);
     j->usCopy = (unsigned)((nowms() - tc) * 1000);
 }
@@ -596,7 +629,7 @@ static void out_release(DState *s, const OutJob *j)   // lock held
 static void out_emit(DState *s, OutJob *j)
 {
     const double te = nowms();
-    VTDecoderSessionEmitDecodedFrame(s->session, j->frame, j->res, j->fl, j->pb);
+    VTDecoderSessionEmitDecodedFrame(s->session, j->frame, j->res, j->fl, j->res ? NULL : j->pb);
     if (j->pb) CVPixelBufferRelease(j->pb);
     j->pb = NULL; j->usEmit = (unsigned)((nowms() - te) * 1000);
 }

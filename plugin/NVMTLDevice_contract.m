@@ -6,6 +6,7 @@
 
 #import <Metal/Metal.h>
 #import "NVMTLObjects.h"
+#include "nvmtl_import_trace.h"
 #import <IOSurface/IOSurfaceRef.h>
 @implementation NVMTLDevice (Contract)
 - (NSUInteger)doubleFPConfig { return 0; }
@@ -16,6 +17,48 @@
 - (BOOL)metalAssertionsEnabled { return NO; }
 - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)a0 { return 256; }
 static void nvbt(const char *tag, int *count, int max);
+static int nvmtl_nocopy_import(nvmtl_import_trace *trace, const char *step,
+                               void *ptr, size_t bytes, nvk_buffer *buf)
+{
+    int rc = nvmtl_vk_buffer_import_nocopy(ptr, bytes, buf);
+    if (rc && trace->id) nvmtl_import_refused(trace, step, rc, ptr, bytes);
+    if (!rc && trace->id) trace->descriptor_created_ns = buf->host_created_us*1000;
+    return rc;
+}
+
+static bool nvmtl_nocopy_alias_on(void)
+{
+    static bool enabled;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *knob = getenv("NVMTL_WS_NOCOPY_ALIAS");
+        const char *name = getprogname();
+        enabled = knob ? !strcmp(knob, "1") : name && !strcmp(name, "WindowServer");
+    });
+    return enabled;
+}
+
+static bool nvmtl_nocopy_import_alias(NVMTLBuffer *buffer, void *ptr, size_t bytes, nvmtl_import_trace *trace)
+{
+    // A second mapping lets RM unpin the pages after the caller releases its mapping.
+    nvmtl_host_alias *alias = nvmtl_vk_host_alias_create(ptr, bytes);
+    if (!alias) return false;
+    void *reservation = nvmtl_vk_reserve_host_retirement();
+    if (!reservation || nvmtl_nocopy_import(trace, "shared_alias", alias->address, bytes, &buffer->_b)) {
+        nvmtl_vk_host_alias_release(alias);
+        free(reservation);
+        return false;
+    }
+    // The Vulkan allocation owns the alias. Metal still exposes the original pointer and
+    // uses the shared storage directly, so submissions never have to copy or resync it.
+    buffer->_b.map = ptr;
+    buffer->_hostRetirement = reservation;
+    buffer->_hostDealloc = ^{ nvmtl_vk_host_alias_release(alias); };
+    nvmtl_vk_note_host_import(&buffer->_b, NVMTL_HOST_NOCOPY_ALIAS, true);
+    nvmtl_import_done(trace, "imported_shared_alias", 0, buffer->_b.host_import_id);
+    return true;
+}
+
 - (id)newBufferWithBytesNoCopy:(void *)a0 length:(NSUInteger)a1 options:(NSUInteger)a2 deallocator:(id)a3
 {
     const MTLStorageMode sm = (MTLStorageMode)((a2 >> MTLResourceStorageModeShift) & 0xF);
@@ -29,14 +72,26 @@ static void nvbt(const char *tag, int *count, int max);
         void *zc = [z contents];
         if (zc) { memset(zc, 0, a1); if (z->_shadow.map) [z didModifyRange:NSMakeRange(0, a1)]; }
         if (a3) { void (^user)(void *, NSUInteger) = [a3 copy]; const NSUInteger n = a1;
-                  z->_hostDealloc = ^(void *p, NSUInteger l) { (void)p; (void)l; user(NULL, n); }; }
+                  z->_hostDealloc = ^{ user(NULL, n); }; }
         { static int said; if (!said++) nvlog("newBufferWithBytesNoCopy: NULL pointer, %lu bytes -> a zero-filled buffer of our own; its deallocator gets (NULL, %lu)", (unsigned long)a1, (unsigned long)a1); }
         return z;
     }
     NVMTLBuffer *b = [NVMTLBuffer new];
+    nvmtl_import_trace trace = nvmtl_import_begin(0, a1, a3 != nil, 0, 0, 0, 0);
+    b->_hostTraceID = trace.id;
     b->_storage = sm;
     b->_ropt = a2 & ((MTLResourceOptions)0xF | ((MTLResourceOptions)0x3 << MTLResourceHazardTrackingModeShift));
-    b->_hostDealloc = a3 ? [a3 copy] : nil;
+    if (a3) {
+        b->_hostRetirement = nvmtl_vk_reserve_host_retirement();
+        if (!b->_hostRetirement) { nvmtl_import_done(&trace, "no_owner_reservation", -1, 0); return nil; }
+        void (^user)(void *, NSUInteger) = [a3 copy];
+        if (trace.id) {
+            uint64_t id = trace.id;
+            b->_hostDealloc = ^{ user(a0, a1); nvmtl_import_release(id, "owner_callback_returned"); };
+        } else {
+            b->_hostDealloc = ^{ user(a0, a1); };
+        }
+    }
     // Managed on a discrete GPU means the GPU works on its own copy, synchronized by didModifyRange (CPU -> GPU) and
     // synchronizeResource (GPU -> CPU). Apple's OpenCL wraps every cl_mem this way; importing the pages zero-copy put
     // every kernel access across PCIe instead (a 5600x4200 byte-image rotate: 6.6 s per dispatch, Geekbench 6 OpenCL
@@ -57,14 +112,19 @@ static void nvbt(const char *tag, int *count, int max);
         nvlog("newBufferWithBytesNoCopy: managed buffers from %lu bytes get a VRAM copy (NVMTL_MANAGED_VRAM_MIN=%s)",
               (unsigned long)vramMin, e ? e : "unset");
     }
-    if (sm == MTLStorageModeManaged && a1 >= vramMin && nvmtl_vk_buffer_import_host(a0, a1, &b->_shadow) == 0) {
+    if (sm == MTLStorageModeManaged && a1 >= vramMin && nvmtl_nocopy_import(&trace, "managed_shadow", a0, a1, &b->_shadow) == 0) {
+
         if (nvmtl_vk_buffer_create(a1, 0, &b->_b) == 0) {
+            nvmtl_vk_note_host_import(&b->_shadow, NVMTL_HOST_NOCOPY_MANAGED, a3 != nil);
             [b didModifyRange:NSMakeRange(0, a1)];
+            nvmtl_import_done(&trace, "imported_managed_shadow", 0, b->_shadow.host_import_id);
             { static int said; if (!said++) nvlog("newBufferWithBytesNoCopy: managed %lu bytes -> VRAM copy, caller's pages are the shadow", (unsigned long)a1); }
             return b;
         }
         nvlog("newBufferWithBytesNoCopy: managed %lu bytes: VRAM refused - the GPU reads the caller's pages directly", (unsigned long)a1);
-        b->_b = b->_shadow; memset(&b->_shadow, 0, sizeof b->_shadow);
+        b->_b = b->_shadow; nvmtl_vk_note_host_import(&b->_b, NVMTL_HOST_NOCOPY_DIRECT, a3 != nil);
+        memset(&b->_shadow, 0, sizeof b->_shadow);
+        nvmtl_import_done(&trace, "imported_direct_after_vram_refusal", 0, b->_b.host_import_id);
         return b;
     }
     // NVMTL_MANAGED_OWNED_VRAM=1: a Managed range the driver cannot import (an unaligned pointer or an unpadded length)
@@ -76,11 +136,13 @@ static void nvbt(const char *tag, int *count, int max);
         if (owned < 0) { const char *e = getenv("NVMTL_MANAGED_OWNED_VRAM"); owned = e && e[0] == '1';
                          nvlog("newBufferWithBytesNoCopy: unimportable managed ranges %s (NVMTL_MANAGED_OWNED_VRAM=%s)", owned ? "get a VRAM copy with owned staging" : "use the system-memory copy", e ? e : "unset"); }
         if (owned) {
+            if (trace.id) trace.fallback = nvmtl_import_now();
             nvmtl_swc *s = (nvmtl_swc *)calloc(1, sizeof *s);
             memset(&b->_shadow, 0, sizeof b->_shadow);
             if (s && nvmtl_swc_init(s, a1) == 0 && nvmtl_vk_buffer_create(a1, 1, &b->_shadow) == 0 && b->_shadow.map &&
                 nvmtl_vk_buffer_create(a1, 0, &b->_b) == 0 && !b->_b.map) {
                 b->_hostPtr = a0; b->_hostLen = (size_t)a1; b->_swc = s;
+                nvmtl_import_done(&trace, "owned_managed_working_copy", 0, 0);
                 { static int said; if (!said++) nvlog("newBufferWithBytesNoCopy: managed %lu bytes at %p cannot be imported -> VRAM copy with owned staging", (unsigned long)a1, a0); }
                 return b;
             }
@@ -92,16 +154,25 @@ static void nvbt(const char *tag, int *count, int max);
             nvlog("newBufferWithBytesNoCopy: managed %lu bytes: VRAM copy refused - the system-memory copy", (unsigned long)a1);
         }
     }
-    if (nvmtl_vk_buffer_import_host(a0, a1, &b->_b) == 0) {
+    trace.fallback = 0;
+    if (sm == MTLStorageModeShared && !a3 && nvmtl_nocopy_alias_on() &&
+        nvmtl_nocopy_import_alias(b, a0, a1, &trace)) return b;
+    if (nvmtl_nocopy_import(&trace, "direct", a0, a1, &b->_b) == 0) {
+        nvmtl_vk_note_host_import(&b->_b, NVMTL_HOST_NOCOPY_DIRECT, a3 != nil);
+        nvmtl_import_done(&trace, "imported_direct", 0, b->_b.host_import_id);
         static int said; if (!said++) nvlog("newBufferWithBytesNoCopy: IMPORTED the caller's pages (%lu bytes at %p) \u2014 zero copy", (unsigned long)a1, a0);
         return b;
     }
+    if (trace.id) trace.fallback = nvmtl_import_now();
     if (nvmtl_vk_buffer_create(a1, 1, &b->_b) || !b->_b.map) {
+        nvmtl_import_done(&trace, "initial_cpu_copy", -1, 0);
         nvmtl_alloc_failed("newBufferWithBytesNoCopy");
+        b->_hostDealloc = nil;  // No Metal buffer was returned; the caller still owns the original allocation.
         nvlog("newBufferWithBytesNoCopy: could neither import nor allocate %lu bytes -> nil", (unsigned long)a1);
         return nil;
     }
     memcpy(b->_b.map, a0, a1);
+    nvmtl_import_done(&trace, "initial_cpu_copy", 0, 0);
     b->_hostPtr = a0; b->_hostLen = (size_t)a1;
     { static int said; if (!said++) nvlog("newBufferWithBytesNoCopy: COPIED %lu bytes at %p (import alignment %zu) \u2014 resynced at every submission",
                                           (unsigned long)a1, a0, nvmtl_vk_host_import_align()); }

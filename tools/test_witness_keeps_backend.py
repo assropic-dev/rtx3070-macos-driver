@@ -18,10 +18,14 @@ def check(name, ok):
     fails += 0 if ok else 1
 
 
-i = src.index('int nvmtl_vk_submit_finish(nvmtl_inflight *f)')
+i = src.index('int nvmtl_vk_submit_finish_observed(')
 fin = src[i:src.index('\n}\n', i)]
 w = fin.index('if (c->wseq && c->wseq != NVMTL_WSEQ_BLIND)')
-wit = fin[w:fin.index('c->timing.host_after_ns', w)]
+wit = fin[w:fin.index('if (c->timing_pool', w)]
+check('surface fence callback runs only after success and before host retirement',
+      fin.index('if (wr != VK_SUCCESS || g_state != 1)') < fin.index('c->timing.host_after_ns')
+      < fin.index('if (observer) observer(context);') < fin.index('nvmtl_image_grace_reap()'))
+check('fence observation precedes host-side retirement', fin.index('c->timing.host_after_ns') < fin.index('nvmtl_image_grace_reap()'))
 check('a lost witness after the fence does not set g_state', 'g_state' not in wit)
 check('a lost witness does not return from submit_finish', 'return' not in wit)
 check('a lost witness marks the command buffer LOST so retire leaks its pool', 'c->wseq = NVMTL_WSEQ_LOST;' in wit)

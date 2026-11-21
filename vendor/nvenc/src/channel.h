@@ -33,3 +33,6 @@ size_t chan_push_used(Chan *c);                // bytes of push buffer in use
 NvU32 chan_error(Chan *c);                     // RM's error notifier status (0 = none)
 // the channel's last MMU fault (NV906F_CTRL_CMD_GET_MMU_FAULT_INFO; RM clears it on read)
 NV_STATUS chan_fault(Chan *c, NvU64 *addr, NvU32 *type, char str[32]);
+
+// Wait for the last method (a release), yielding after a short poll.
+bool chan_wait_release(Chan *c, const RmMem *sem, NvU32 expected);

@@ -23,9 +23,9 @@ static inline NSMutableData *nvmtl_fc_storage(NSUInteger count) {
     if (!count || count > NSUIntegerMax / stride) return nil;
     return [NSMutableData dataWithLength:count * stride];
 }
-@class NVMTLHeap;
+@class NVMTLHeap, NVMTLCommandBuffer;
 @interface NVMTLBuffer : NSObject <MTLBuffer> { @public nvk_buffer _b; MTLStorageMode _storage; NVMTLHeap *_heap; NSUInteger _heapOffset;
-    void *_hostPtr; size_t _hostLen; id _hostDealloc;
+    void *_hostPtr; size_t _hostLen; id _hostDealloc; void *_hostRetirement; uint64_t _hostTraceID;
     NVMTLHeap *_subHeap; NSUInteger _subCharge; BOOL _aliased;
     nvk_buffer _shadow; int _syncOut; int _zshadow;
     void *_swc;   /* nvmtl_swc*: this Shared buffer has a VRAM working copy (_b) and its system-memory side in _shadow */
@@ -54,8 +54,10 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); if (b->
   uint32_t _viewType, _viewSlices, _relativeLevel, _relativeSlice;
   uint32_t _baseSlice, _baseLevel;
   uint32_t _surfSeed, _surfGen; BOOL _surfSynced, _surfOwned;
-  nvk_buffer _vramBuf; BOOL _vramOn;
-  nvk_buffer _hostPages;   // this surface's pages imported for the host copies (nvmtl_host_pages), kept while they hold
+  BOOL _requestedSampleOnly;
+  nvk_buffer _vramBuf; BOOL _vramOn; id _familyImport;
+  uint64_t _decodedGeneration;
+  nvmtl_host_page_cache _hostPages;   // this surface's pages imported for host copies, kept while the mapped range matches
   BOOL _stex;
   uint64_t _resid;
   NSUInteger _usage;
@@ -64,7 +66,9 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); if (b->
 - (nvk_image *)nvi;
 - (void *)nvview;
 - (void *)nvsampleview;
-- (void)nvmtlSurfaceIn;
+- (BOOL)nvmtlSurfaceCopyable;
+- (BOOL)nvmtlSurfaceIn;
+- (BOOL)nvmtlSurfaceInForSample:(NVMTLTexture *__autoreleasing *)sample commandBuffer:(NVMTLCommandBuffer *)cb;
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
 @end
@@ -130,12 +134,15 @@ extern id gNVMTLMainDevice;
   NSError *_cbError;
   NSMutableDictionary *_userDictionary;
   @public nvk_cmdbuf _c; NVMTLCommandQueue *_queue; BOOL _committed, _commitMarking, _partsRetiring; BOOL _capacityHeld; MTLCommandBufferStatus _cbstatus;
+  BOOL _wsWaitForCompletion;
   NVMTLTexture *_present;
   NSMutableArray *_presentations;
   NSMutableArray *_handlers;
   NSMutableArray *_scratch;
   NSMutableSet *_resources;
   NSMutableSet *_surfDirty;
+  NSMutableSet *_sampleReads;
+  BOOL _sampleEventWait;
   NSMutableSet *_surfOverwrites; // contents defined by writes recorded in this command buffer
   unsigned _nEnc, _nEnd, _nHandlers, _nStatus, _nEnqueue, _nLabel, _nPresent, _nWait;
   unsigned _nEncSealed;
@@ -354,7 +361,6 @@ BOOL nvmtl_air_grid_only(NVMTLFunction *fn);
 @interface NVMTLBuffer () { @public BOOL _subPlaced; } @end
 typedef struct { nvk_image img; uint32_t key[12]; NSUInteger off, len; } nvmtl_park_t;
 @interface NVMTLTexture () { @public BOOL _subPlaced, _parkable; uint32_t _pkey[12]; NSUInteger _pkLen; } @end
-@interface NVMTLTexture () { @public BOOL _clientWritten; } @end
 @interface NVMTLCommandBuffer () { @public NSDictionary *_busyMarks; } @end
 @interface NVMTLHeap () { @public nvmtl_park_t *_pk; uint32_t _npk; } @end
 // Lazy backing: _lzc = slot size (0 = the heap owns one _hm of its full size). _lzo[slot] = 1 + index into _lzm/_lzb (0 = no

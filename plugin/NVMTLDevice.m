@@ -19,6 +19,7 @@
 #include <string.h>
 #include <syslog.h>
 #include <notify.h>
+#include <poll.h>
 #include <mach-o/dyld.h>
 #include <unistd.h>
 #include <stdint.h>
@@ -38,6 +39,7 @@
 #include "nvmtl_claims.h"
 #include "nvmtl_gpu_policy.h"
 #include "nvmtl_card_select.h"
+static void nvmtl_ws_open_mark_channel(io_service_t accelerator);
 extern uint64_t nvmtl_card_registry_id;   // nvmtl_vk.c
 // The application profile matched for this process (nvmtl_app_profile.h), or NULL. Set once by nvmtl_conf_settle
 // (NVMTLObjects.m), which reads nvrm610.conf and applies the profile before any knob is read.
@@ -141,18 +143,34 @@ const char *nvmtl_log_path(void) {
     return path;
 }
 static void nvlog_line(const char *t);
+static void nvlog_repeated_line(const char *line, uint64_t rep) {
+    if (!rep) { nvlog_line(line); return; }
+    char t[640];
+    snprintf(t, sizeof t, "%s   [logged %llu times now]", line, (unsigned long long)rep);
+    nvlog_line(t);
+}
 void nvlog(const char *fmt, ...) {
     uint64_t rep; if (nvlog_dropped(fmt, &rep)) return;
     char b[512]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a);
-    char t[640];
-    if (rep) snprintf(t, sizeof t, "%s   [logged %llu times now]", b, (unsigned long long)rep);
-    else     snprintf(t, sizeof t, "%s", b);
-    nvlog_line(t);
+    nvlog_repeated_line(b, rep);
+}
+static void nvlog_pixel_sampler(NSDictionary *state) {
+    static const char fmt[] = "pixel sampler: %s";
+    uint64_t rep;
+    if (nvlog_dropped(fmt, &rep)) return;
+#if NVMTL_RELEASE
+    // The sampler report contains only fixed descriptor fields and numbers,
+    // so it goes only to the opted-in file in release builds.
+    if (!nvmtl_process_env_on()) return;
+#endif
+    char b[512];
+    snprintf(b, sizeof b, fmt, state.description.UTF8String);
+    nvlog_repeated_line(b, rep);
 }
 // A periodic census line: the same format every window, so the repeat limiter above would drop it after a few windows
 // (a run's gameplay windows were lost that way). It goes to the log every time; the caller keeps its own period.
 void nvlog_every(const char *fmt, ...) {
-    char t[640]; va_list a; va_start(a, fmt); vsnprintf(t, sizeof t, fmt, a); va_end(a);
+    char t[2048]; va_list a; va_start(a, fmt); vsnprintf(t, sizeof t, fmt, a); va_end(a);
     nvlog_line(t);
 }
 static void nvlog_line(const char *t) {
@@ -809,6 +827,18 @@ static uint64_t nvmtl_rt_gate_working_set(uint64_t ws)
     if (!said++) nvlog("working set: answered %lld MB instead of %llu MB while ray tracing is available (NVMTL_WS_RT_GATE_MB)", floor_mb, (unsigned long long)(ws >> 20));
     return (uint64_t)floor_mb << 20;
 }
+@interface NVMTLFamilyImport : NSObject {
+    @public nvk_buffer buffer;
+    IOSurfaceRef surface;
+}
+@end
+@implementation NVMTLFamilyImport
+- (void)dealloc {
+    nvmtl_vk_buffer_destroy(&buffer);
+    if (surface) CFRelease(surface);
+}
+@end
+
 @implementation NVMTLDevice
 @dynamic depth24Stencil8PixelFormatSupported, headless, location, locationNumber, lowPower, maxArgumentBufferSamplerCount, maxTransferRate, peerCount, peerGroupID, peerIndex, registryID, removable, sparseTileSizeInBytes, supportsPlacementSparse;
 + (void)load {
@@ -981,6 +1011,7 @@ static id nvmtl_refuse_before_init(id obj)
         nvlog("  NVK did not come up in this process - refusing to be the Metal device for %s", getprogname());
         return nil;
     }
+    nvmtl_ws_open_mark_channel(port);
     nvmtl_gl_caps_enable();
     if (nvmtl_vk_vendor() == 0x1002 || nvmtl_vk_vendor() == 0x8086) nvmtl_nmxvt_register();
     if (nvmtl_vk_vendor() == 0x10de) {   /* NVDEC/NVENC are NVIDIA engines reached through NVRM */
@@ -1440,24 +1471,40 @@ static id<MTLTexture> nvmtl_make_y422_texture(MTLTextureDescriptor *d, NVMTLText
 
 typedef struct { uint32_t magic, seed, gen; } nvmtl_vram_tag;
 #define NVMTL_VRAM_MAGIC 0x564d5634u
+#define NVMTL_GPU_HOST_MAGIC 0x47485031u   // a GPU writer published to the IOSurface's host backing
 static unsigned long long g_surf_vram, g_surf_private, g_surfin_skip, g_surfin_copy;
-static CFStringRef nvmtl_vram_tag_key(NSUInteger plane) { return CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLVramAt:p%lu"), (unsigned long)plane); }
-static int nvmtl_vram_tag_current(IOSurfaceRef surf, NSUInteger plane, uint32_t seed)
+static CFStringRef nvmtl_vram_tag_key(NSUInteger plane)
+{
+    if (plane == 0) return (CFStringRef)CFRetain(CFSTR("NVMTLVramAt:p0"));
+    if (plane == 1) return (CFStringRef)CFRetain(CFSTR("NVMTLVramAt:p1"));
+    return CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLVramAt:p%lu"), (unsigned long)plane);
+}
+static nvmtl_vram_tag nvmtl_read_vram_tag(IOSurfaceRef surf, NSUInteger plane)
 {
     CFStringRef k = nvmtl_vram_tag_key(plane); CFTypeRef v = IOSurfaceCopyValue(surf, k); CFRelease(k);
     nvmtl_vram_tag t = { 0, 0, 0 };
     int ok = v && CFGetTypeID(v) == CFDataGetTypeID() && CFDataGetLength((CFDataRef)v) == (CFIndex)sizeof t;
     if (ok) memcpy(&t, CFDataGetBytePtr((CFDataRef)v), sizeof t);
     if (v) CFRelease(v);
-    return ok && t.magic == NVMTL_VRAM_MAGIC && t.seed == seed;
+    return t;
+}
+static int nvmtl_vram_tag_current(IOSurfaceRef surf, NSUInteger plane, uint32_t seed)
+{
+    const nvmtl_vram_tag t = nvmtl_read_vram_tag(surf, plane);
+    return t.magic == NVMTL_VRAM_MAGIC && t.seed == seed;
 }
 static uint32_t nvmtl_vram_gen(IOSurfaceRef surf, NSUInteger plane)
 {
-    CFStringRef k = nvmtl_vram_tag_key(plane); CFTypeRef v = IOSurfaceCopyValue(surf, k); CFRelease(k);
-    nvmtl_vram_tag t = { 0, 0, 0 };
-    if (v && CFGetTypeID(v) == CFDataGetTypeID() && CFDataGetLength((CFDataRef)v) == (CFIndex)sizeof t) memcpy(&t, CFDataGetBytePtr((CFDataRef)v), sizeof t);
-    if (v) CFRelease(v);
-    return t.magic == NVMTL_VRAM_MAGIC ? t.gen : 0;
+    const nvmtl_vram_tag t = nvmtl_read_vram_tag(surf, plane);
+    return t.magic == NVMTL_VRAM_MAGIC || t.magic == NVMTL_GPU_HOST_MAGIC ? t.gen : 0;
+}
+static uint32_t nvmtl_host_gpu_generation(IOSurfaceRef surf, NSUInteger plane, uint32_t seed)
+{
+    nvmtl_vram_tag t = { NVMTL_GPU_HOST_MAGIC, seed, nvmtl_vram_gen(surf, plane) + 1 };
+    CFDataRef value = CFDataCreate(NULL, (const UInt8 *)&t, sizeof t);
+    CFStringRef key = nvmtl_vram_tag_key(plane);
+    IOSurfaceSetValue(surf, key, value); CFRelease(key); CFRelease(value);
+    return t.gen;
 }
 static void nvmtl_vram_tag_write(IOSurfaceRef surf, NSUInteger plane, uint32_t seed, uint32_t gen)
 {
@@ -1475,12 +1522,40 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
     CFDataRef d = CFDataCreate(NULL, (const UInt8 *)&t, sizeof t); CFStringRef k = nvmtl_vram_tag_key(plane);
     IOSurfaceSetValue(surf, k, d); CFRelease(k); CFRelease(d);
 }
-typedef struct { uint32_t magic, done; uint64_t stamp_ns, seq; int32_t pid; uint32_t pad; } nvmtl_busy_tag;
+typedef struct { uint32_t magic, done; uint64_t stamp_ns, seq; int32_t pid; uint32_t flags; } nvmtl_busy_tag;
 #define NVMTL_BUSY_MAGIC 0x4255535au
-#define NVMTL_BUSY_WAIT_NS  (10ull * 1000 * 1000)
-#define NVMTL_BUSY_STALE_NS (100ull * 1000 * 1000)
+#define NVMTL_BUSY_CAN_NOTIFY 1u
+#define NVMTL_BUSY_WAIT_NS (100ull * 1000 * 1000)
 #define NVMTL_BUSY_POLL_US 100
-static CFStringRef nvmtl_busy_key(NSUInteger plane) { return CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLBusyAt:p%lu"), (unsigned long)plane); }
+static _Atomic int nvmtl_busy_notify_failed;
+static BOOL nvmtl_busy_notify_enabled(void)
+{
+    static BOOL enabled; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *v = getenv("NVMTL_SURFACE_NOTIFY");
+        enabled = !(v && v[0] == '0');
+    });
+    return enabled && !atomic_load(&nvmtl_busy_notify_failed);
+}
+static void nvmtl_busy_notify_name(int32_t pid, char name[64])
+{
+    snprintf(name, 64, "com.nullmoth.nvmtl.surface-ready.%d", pid);
+}
+// The sequence and done bit on the IOSurface remain authoritative. Only one wake is
+// needed per completing command buffer, even when it publishes several surfaces.
+static void nvmtl_busy_notify_done(void)
+{
+    if (!nvmtl_busy_notify_enabled()) return;
+    char name[64];
+    nvmtl_busy_notify_name(getpid(), name);
+    if (notify_post(name) != NOTIFY_STATUS_OK) atomic_store(&nvmtl_busy_notify_failed, 1);
+}
+static CFStringRef nvmtl_busy_key(NSUInteger plane)
+{
+    if (plane == 0) return (CFStringRef)CFRetain(CFSTR("NVMTLBusyAt:p0"));
+    if (plane == 1) return (CFStringRef)CFRetain(CFSTR("NVMTLBusyAt:p1"));
+    return CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLBusyAt:p%lu"), (unsigned long)plane);
+}
 static int nvmtl_busy_read(IOSurfaceRef surf, NSUInteger plane, nvmtl_busy_tag *out)
 {
     CFStringRef k = nvmtl_busy_key(plane); CFTypeRef v = IOSurfaceCopyValue(surf, k); CFRelease(k);
@@ -1494,115 +1569,391 @@ static int nvmtl_busy_read(IOSurfaceRef surf, NSUInteger plane, nvmtl_busy_tag *
 }
 static void nvmtl_busy_write(IOSurfaceRef surf, NSUInteger plane, uint64_t seq, int done)
 {
-    nvmtl_busy_tag t = { NVMTL_BUSY_MAGIC, (uint32_t)done, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW), seq, getpid(), 0 };
+    nvmtl_busy_tag t = { NVMTL_BUSY_MAGIC, (uint32_t)done, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW), seq, getpid(),
+                         nvmtl_busy_notify_enabled() ? NVMTL_BUSY_CAN_NOTIFY : 0 };
     CFDataRef d = CFDataCreate(NULL, (const UInt8 *)&t, sizeof t); CFStringRef k = nvmtl_busy_key(plane);
     IOSurfaceSetValue(surf, k, d); CFRelease(k); CFRelease(d);
 }
-static int nvmtl_busy_foreign(IOSurfaceRef surf, NSUInteger plane)
+static BOOL nvmtl_busy_wait(IOSurfaceRef surf, NSUInteger plane)
 {
     nvmtl_busy_tag t;
-    return nvmtl_busy_read(surf, plane, &t) && t.pid != getpid();
-}
-static void nvmtl_busy_wait(IOSurfaceRef surf, NSUInteger plane)
-{
-    nvmtl_busy_tag t;
-    if (!nvmtl_busy_read(surf, plane, &t) || t.done || t.pid == getpid()) return;
+    if (!nvmtl_busy_read(surf, plane, &t) || t.done || t.pid == getpid()) return YES;
     const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-    if (t.stamp_ns <= t0 && t0 - t.stamp_ns > NVMTL_BUSY_STALE_NS) return;
-    for (;;) {
-        usleep(NVMTL_BUSY_POLL_US);
-        if (!nvmtl_busy_read(surf, plane, &t) || t.done || t.pid == getpid()) return;
-        const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-        if (now - t0 > NVMTL_BUSY_WAIT_NS || (t.stamp_ns <= now && now - t.stamp_ns > NVMTL_BUSY_STALE_NS)) return;
+    BOOL ready = YES;
+    int fd = -1, token = -1;
+    const int32_t producer = t.pid;
+    if ((t.flags & NVMTL_BUSY_CAN_NOTIFY) && producer > 0 && nvmtl_busy_notify_enabled()) {
+        char name[64]; nvmtl_busy_notify_name(producer, name);
+        if (notify_register_file_descriptor(name, &fd, 0, &token) != NOTIFY_STATUS_OK) fd = -1;
     }
+    // Check again after registration. A completion before registration, a coalesced or
+    // spurious wake, or a newer submission must all be resolved against the current tag.
+    while (nvmtl_busy_read(surf, plane, &t) && !t.done && t.pid != getpid()) {
+        const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        const uint64_t elapsed = now - t0;
+        if (elapsed >= NVMTL_BUSY_WAIT_NS || (t.stamp_ns <= now && now - t.stamp_ns >= NVMTL_BUSY_WAIT_NS)) {
+            ready = NO;
+            break;
+        }
+        if (fd >= 0 && t.pid == producer && (t.flags & NVMTL_BUSY_CAN_NOTIFY)) {
+            struct pollfd pfd = { fd, POLLIN, 0 };
+            // A suppressed notification should cost at most a millisecond before rechecking.
+            const int rc = poll(&pfd, 1, 1);
+            if (rc == 0) continue;
+            uint32_t posted;
+            if (rc > 0 && (pfd.revents & POLLIN) && read(fd, &posted, sizeof posted) == sizeof posted) continue;
+            notify_cancel(token); fd = -1;
+        }
+        usleep(NVMTL_BUSY_POLL_US);   // older writer or notification unavailable
+    }
+    if (fd >= 0) notify_cancel(token);
+    return ready;
 }
-// Shared family-VRAM imports (nvmtl_import_cache.h). OFF unless NVMTL_SURF_IMPORT_CACHE=1: it is proven by
-// tools/test_import_cache.c, but its effect on screen capture has to be measured on a card before it is the default.
-// NVMTL_SURF_IMPORT_CACHE_IDLE_MS (default 2000) is how long an import outlives its last wrapper; surfaces larger than
-// NVMTL_SURF_IMPORT_CACHE_MAX_MB (default 64, 16 below 8 GB of VRAM) are imported per wrapper as without the cache.
+// Shared family-VRAM imports. Each Metal wrapper still gets a fresh
+// VkImage/view; CPU seed checks and GPU write publication are unchanged.
 #include "nvmtl_import_cache.h"
+#include "../kexts/NVRM/nvrm_surfshare_abi.h"
 #include <os/lock.h>
-_Static_assert(sizeof(nvk_buffer) <= NVMTL_IC_PAYLOAD, "an import cache slot must hold a whole nvk_buffer");
+typedef struct {
+    const void *owner;   // one retained NVMTLFamilyImport per cache entry
+    size_t charge;
+} nvmtl_family_ref;
+_Static_assert(sizeof(nvmtl_family_ref) <= NVMTL_IC_PAYLOAD, "family import metadata too large");
+
+typedef struct {
+    uintptr_t device;
+    uint32_t cookie;
+    uint64_t grants, releases, deallocs;
+} nvmtl_backing_epoch;
+static uintptr_t nvmtl_vk_import_device(void);
+static uint32_t nvmtl_vk_import_cookie(uint32_t sid);
+static uint64_t nvmtl_vk_family_cache_excess(void);
 static nvmtl_ic g_ic;
 static os_unfair_lock g_ic_lock = OS_UNFAIR_LOCK_INIT;
-static uint64_t nvmtl_ic_env_u64(const char *name, uint64_t def)
+static nvmtl_backing_epoch g_ic_epoch;
+static uint64_t g_ic_generation, g_ic_publications, g_ic_bytes;
+static _Atomic uint64_t g_ic_hits, g_ic_misses, g_ic_inserts, g_ic_unknown;
+static bool g_ic_cleanup_scheduled;
+
+void nvmtl_surface_import_stats(uint64_t out[6])
 {
-    const char *e = getenv(name); if (!e || !*e) return def;
-    char *end; const unsigned long long v = strtoull(e, &end, 10); return end == e ? def : v;
+    out[0] = atomic_load(&g_ic_hits); out[1] = atomic_load(&g_ic_misses);
+    out[2] = atomic_load(&g_ic_inserts); out[3] = atomic_load(&g_ic_unknown);
+    os_unfair_lock_lock(&g_ic_lock);
+    out[4] = g_ic_bytes; out[5] = 0;
+    for (unsigned i = 0; i < NVMTL_IC_SLOTS; i++) if (g_ic.s[i].id) out[5]++;
+    os_unfair_lock_unlock(&g_ic_lock);
 }
-static int nvmtl_ic_on(void)
+static uint64_t nvmtl_ic_option(const char *name, uint64_t fallback, uint64_t limit)
 {
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_SURF_IMPORT_CACHE"); on = e && e[0] == '1';
-                  nvlog("family VRAM import cache %s (NVMTL_SURF_IMPORT_CACHE=%s)", on ? "on" : "off", e ?: "unset"); }
-    return on;
+    const char *text = getenv(name);
+    if (!text || !*text || *text == '-') return fallback;
+    char *end = NULL;
+    unsigned long long value = strtoull(text, &end, 10);
+    return end == text || *end ? fallback : MIN(value, limit);
 }
-static uint64_t nvmtl_ic_idle_ns(void) { static uint64_t v; static dispatch_once_t o; dispatch_once(&o, ^{ v = nvmtl_ic_env_u64("NVMTL_SURF_IMPORT_CACHE_IDLE_MS", 2000) * 1000000ull; }); return v; }
+static bool nvmtl_ic_on(void)
+{
+    static bool enabled; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("NVMTL_SURF_IMPORT_CACHE"), *process = getprogname();
+        enabled = e ? !strcmp(e, "1") : process && !strcmp(process, "WindowServer");
+    });
+    return enabled;
+}
+static uint64_t nvmtl_ic_idle_ns(void)
+{
+    static uint64_t ns; static dispatch_once_t once;
+    dispatch_once(&once, ^{ ns = nvmtl_ic_option("NVMTL_SURF_IMPORT_CACHE_IDLE_MS", 2000, 10000) * 1000000ull; });
+    return ns;
+}
+static bool nvmtl_ic_keep_warm(void)
+{
+    static bool enabled; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("NVMTL_SURF_IMPORT_CACHE_KEEP"), *process = getprogname();
+        enabled = e ? !strcmp(e, "1") : process && !strcmp(process, "WindowServer") &&
+                                        !getenv("NVMTL_SURF_IMPORT_CACHE_IDLE_MS");
+        enabled = enabled && nvmtl_ic_idle_ns() != 0;
+    });
+    return enabled;
+}
 static uint64_t nvmtl_ic_max_bytes(void)
 {
-    static uint64_t v; static dispatch_once_t o;
-    dispatch_once(&o, ^{ v = nvmtl_ic_env_u64("NVMTL_SURF_IMPORT_CACHE_MAX_MB", nvmtl_vk_vram_bytes() >= (8ull << 30) ? 64 : 16) << 20; });
-    return v;
+    static uint64_t bytes; static dispatch_once_t once;
+    dispatch_once(&once, ^{ bytes = nvmtl_ic_option("NVMTL_SURF_IMPORT_CACHE_MAX_MB",
+        nvmtl_vk_vram_bytes() >= (8ull << 30) ? 64 : 16, 128) << 20; });
+    return bytes;
 }
-// The cookie an import stores in its surface; a surface id that is reused after the surface is freed carries none.
-static CFStringRef nvmtl_ic_key(void)
+static uint64_t nvmtl_ic_budget(void)
 {
-    static CFStringRef k; static dispatch_once_t o;
-    dispatch_once(&o, ^{ k = CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLImport.%d"), (int)getpid()); });
-    return k;
+    static uint64_t bytes; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const uint64_t max_mb = 8192;
+        uint64_t fallback_mb = 64;
+        if (nvmtl_vk_vram_bytes() >= (8ull << 30)) {
+            const char *process = getprogname();
+            fallback_mb = process && !strcmp(process, "WindowServer") ? 8192 : 256;
+        }
+        bytes = nvmtl_ic_option("NVMTL_SURF_IMPORT_CACHE_BUDGET_MB", fallback_mb, max_mb) << 20;
+        nvlog("IOSurface import cache budget: %llu MiB", (unsigned long long)(bytes >> 20));
+    });
+    return bytes;
 }
-static uint64_t nvmtl_ic_cookie_read(IOSurfaceRef surf)
+
+// Retaining an IOSurface protects its ID, not a GPU backing that the
+// IOAccelerator family may deallocate, re-grant or park. The installed kexts
+// expose read-only counters for all three events. On kernels/sandboxes without
+// these counters the regular import path is authoritative.
+static bool nvmtl_ic_read_epoch(uint32_t sid, nvmtl_backing_epoch *ep)
 {
-    uint64_t c = 0; CFTypeRef v = IOSurfaceCopyValue(surf, nvmtl_ic_key());
-    if (v && CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)v, kCFNumberSInt64Type, &c);
-    if (v) CFRelease(v);
-    return c;
+    if (!(ep->device = nvmtl_vk_import_device())) return false;
+    static bool cookies; static dispatch_once_t probe;
+    dispatch_once(&probe, ^{ cookies = nvmtl_vk_import_cookie(0) == NVRM_SS_PLANE_COOKIE; });
+    ep->cookie = 0;
+    if (cookies) {
+        const uint32_t cookie = nvmtl_vk_import_cookie(sid);
+        if (!cookie || cookie > NVRM_SS_COOKIE_MAX) return false;
+        ep->cookie = cookie;
+        return true;
+    }
+    static struct { int mib[CTL_MAXNAME]; size_t n; } counters[3];
+    static bool available; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *names[] = {"debug.nvrmfb_vram_grants", "debug.nvrmfb_vram_releases", "debug.nvaccel_vm_dealloc"};
+        for (unsigned i = 0; i < 3; i++) {
+            counters[i].n = CTL_MAXNAME;
+            if (sysctlnametomib(names[i], counters[i].mib, &counters[i].n) != 0) return;
+        }
+        available = true;
+    });
+    if (!available) return false;
+    uint64_t *values[] = {&ep->grants, &ep->releases, &ep->deallocs};
+    for (unsigned i = 0; i < 3; i++) {
+        size_t n = sizeof **values;
+        if (sysctl(counters[i].mib, (u_int)counters[i].n, values[i], &n, NULL, 0) || n != sizeof **values) return false;
+    }
+    return true;
 }
-static void nvmtl_ic_destroy_all(unsigned char (*gone)[NVMTL_IC_PAYLOAD], int n)
+static bool nvmtl_ic_epoch_equal(nvmtl_backing_epoch a, nvmtl_backing_epoch b)
 {
-    for (int i = 0; i < n; i++) { nvk_buffer b; memcpy(&b, gone[i], sizeof b); nvmtl_vk_buffer_destroy(&b); }
+    if (a.cookie || b.cookie) return a.device == b.device && a.cookie == b.cookie;
+    return a.device == b.device && a.grants == b.grants && a.releases == b.releases && a.deallocs == b.deallocs;
 }
-static void nvmtl_ic_expire_now(void)
+static uint64_t nvmtl_ic_observe(nvmtl_backing_epoch ep)
+{
+    // g_ic_lock held. A change elsewhere on this GPU can cause an extra import;
+    // no shared, client-writable IOSurface attachment participates in the identity.
+    if (!g_ic_generation || g_ic_epoch.device != ep.device || (!ep.cookie && !nvmtl_ic_epoch_equal(g_ic_epoch, ep))) {
+        g_ic_epoch = ep;
+        g_ic_generation++;
+        for (unsigned i = 0; i < NVMTL_IC_SLOTS; i++) if (g_ic.s[i].id) g_ic.s[i].stale = 1;
+    }
+    return ep.cookie ? ep.cookie : g_ic_generation;
+}
+static size_t nvmtl_ic_charge(const void *payload)
+{
+    nvmtl_family_ref e; memcpy(&e, payload, sizeof e); return e.charge;
+}
+static void nvmtl_ic_destroy(const void *payload)
+{
+    nvmtl_family_ref e; memcpy(&e, payload, sizeof e); CFRelease(e.owner);
+}
+static void nvmtl_ic_schedule_cleanup(uint64_t delay);
+static void nvmtl_ic_cleanup(void)
 {
     unsigned char gone[NVMTL_IC_SLOTS][NVMTL_IC_PAYLOAD];
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), idle = nvmtl_ic_idle_ns();
+    const bool keep = nvmtl_ic_keep_warm();
+    // Recheck whole-card usage on the next tick after a bounded cleanup batch.
+    const uint64_t target = keep ? MIN(nvmtl_vk_family_cache_excess(), 256ull << 20) : 0;
+    uint64_t trimmed = 0;
+    uint64_t next = UINT64_MAX;
     os_unfair_lock_lock(&g_ic_lock);
-    const int n = nvmtl_ic_expire(&g_ic, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), nvmtl_ic_idle_ns(), 0, gone, NVMTL_IC_SLOTS);
+    int n = nvmtl_ic_expire(&g_ic, now, keep ? UINT64_MAX : idle, idle == 0, gone, NVMTL_IC_SLOTS);
+    for (int i = 0; i < n; i++) g_ic_bytes -= nvmtl_ic_charge(gone[i]);
+    const int expired = n;
+    while (trimmed < target && n < NVMTL_IC_SLOTS && nvmtl_ic_evict_idle(&g_ic, gone[n])) {
+        const size_t charge = nvmtl_ic_charge(gone[n++]);
+        trimmed += charge;
+        g_ic_bytes -= charge;
+    }
+    for (unsigned i = 0; i < NVMTL_IC_SLOTS; i++) {
+        const nvmtl_ic_slot *slot = &g_ic.s[i];
+        if (slot->id && !slot->refs) next = MIN(next, (keep ? now : slot->idle_since) + idle + 1);
+    }
+    g_ic_cleanup_scheduled = next != UINT64_MAX;
     os_unfair_lock_unlock(&g_ic_lock);
-    nvmtl_ic_destroy_all(gone, n);
+    for (int i = 0; i < n; i++) nvmtl_ic_destroy(gone[i]);
+    if (trimmed) nvlog("IOSurface import cache: VRAM pressure released %d lookup entries (%llu MiB of cache charge)",
+                       n - expired, (unsigned long long)(trimmed >> 20));
+    if (next != UINT64_MAX) nvmtl_ic_schedule_cleanup(next > now ? next - now : 0);
 }
-// The plane-0 family VRAM of `surf` as a buffer: the shared import when the cache is on and has one, else a new import.
-// Release with nvmtl_ic_put. 0 = ok.
-static int nvmtl_ic_get(IOSurfaceRef surf, size_t need, nvk_buffer *out)
+static void nvmtl_ic_schedule_cleanup(uint64_t delay)
+{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)delay),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ nvmtl_ic_cleanup(); });
+}
+// The family table and each active wrapper hold separate strong references.
+// With an identity output, take a candidate to validate outside the mutex.
+// On insertion only a duplicate of the exact observed generation can win.
+static NVMTLFamilyImport *nvmtl_ic_find_locked(uint32_t sid, size_t span, uint64_t generation,
+                                               nvmtl_backing_epoch *identity, uint64_t now)
+{
+    for (unsigned i = 0; i < NVMTL_IC_SLOTS; i++) {
+        nvmtl_ic_slot *slot = &g_ic.s[i];
+        if (!slot->id || slot->sid != sid || slot->need != span || slot->stale) continue;
+        if (identity) {
+            *identity = g_ic_epoch;
+            if (identity->cookie) identity->cookie = (uint32_t)slot->cookie;
+        } else if (slot->cookie != generation) { slot->stale = 1; continue; }
+        nvmtl_family_ref entry; memcpy(&entry, slot->payload, sizeof entry);
+        slot->idle_since = now;
+        return (__bridge NVMTLFamilyImport *)entry.owner;
+    }
+    return nil;
+}
+static int nvmtl_ic_get(IOSurfaceRef surf, uint32_t plane, size_t need, nvk_buffer *out, NVMTLFamilyImport *__strong *lease)
 {
     const uint32_t sid = IOSurfaceGetID(surf);
-    if (!nvmtl_ic_on() || need > nvmtl_ic_max_bytes()) return nvmtl_vk_surface_vram(sid, 0, need, out);
-    nvmtl_ic_expire_now();
-    const uint64_t have = nvmtl_ic_cookie_read(surf);
+    *lease = nil;
+    if (!nvmtl_ic_on() || plane != 0 || IOSurfaceGetPlaneCount(surf) > 1) {
+        atomic_fetch_add(&g_ic_misses, 1);
+        return nvmtl_vk_surface_vram(sid, plane, need, out);
+    }
+    // Two wrappers may cover different heights of the same plane. Import its
+    // complete addressable rows, not its page padding or the first view's size.
+    const size_t rows = IOSurfaceGetHeight(surf), pitch = IOSurfaceGetBytesPerRow(surf);
+    const size_t span = (pitch && rows <= SIZE_MAX / pitch) ? rows * pitch : 0;
+    const size_t charge = IOSurfaceGetAllocSize(surf);
+    const uint64_t budget = nvmtl_ic_budget();
+    nvmtl_backing_epoch cached = {0}, before = {0}, after = {0};
+    const bool eligible = need && need <= span && span <= charge && charge <= nvmtl_ic_max_bytes() && charge <= budget;
+    NVMTLFamilyImport *hit = nil;
+    if (eligible) {
+        os_unfair_lock_lock(&g_ic_lock);
+        hit = nvmtl_ic_find_locked(sid, span, 0, &cached, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+        os_unfair_lock_unlock(&g_ic_lock);
+    }
+    if (!eligible || !nvmtl_ic_read_epoch(sid, &before)) {
+        atomic_fetch_add(&g_ic_misses, 1);
+        if (eligible) atomic_fetch_add(&g_ic_unknown, 1);
+        return nvmtl_vk_surface_vram(sid, plane, need, out);
+    }
+    if (hit && nvmtl_ic_epoch_equal(cached, before)) {
+        atomic_fetch_add(&g_ic_hits, 1); *out = hit->buffer; *lease = hit; return 0;
+    }
+    hit = nil; // Release an evicted candidate before taking the cache lock again.
     os_unfair_lock_lock(&g_ic_lock);
-    const int hit = have && nvmtl_ic_acquire(&g_ic, sid, need, have, out, sizeof *out);
+    const uint64_t generation = nvmtl_ic_observe(before);
+    const uint64_t tableGeneration = g_ic_generation;
+    const uint64_t publications = g_ic_publications;
     os_unfair_lock_unlock(&g_ic_lock);
-    if (hit) return 0;
-    if (nvmtl_vk_surface_vram(sid, 0, need, out)) return -1;
-    static _Atomic uint64_t next = 1;
-    const uint64_t cookie = ((uint64_t)getpid() << 32) | (atomic_fetch_add(&next, 1) & 0xffffffffu);
-    CFNumberRef cn = CFNumberCreate(NULL, kCFNumberSInt64Type, &cookie); IOSurfaceSetValue(surf, nvmtl_ic_key(), cn); CFRelease(cn);
-    unsigned char evicted[NVMTL_IC_PAYLOAD]; uintptr_t evicted_id = 0;
+    atomic_fetch_add(&g_ic_misses, 1);
+    // Resolve and export under one kernel family lock. A change between our
+    // first query and the import cannot tag a different allocation as this one.
+    const uint32_t selector = before.cookie ? NVRM_SS_PLANE_COOKIE | before.cookie : plane;
+    if (nvmtl_vk_surface_vram(sid, selector, span, out)) {
+        // An ordinary smaller wrapper may still fit a short kernel allocation.
+        if (!before.cookie && span == need) return -1;
+        atomic_fetch_add(&g_ic_misses, 1);
+        return nvmtl_vk_surface_vram(sid, plane, need, out);
+    }
+    if (!nvmtl_ic_read_epoch(sid, &after) || !nvmtl_ic_epoch_equal(before, after)) {
+        // The first export may refer to the backing from before a rebind.
+        // Resolve the caller's view again on the ordinary, uncached path.
+        atomic_fetch_add(&g_ic_unknown, 1);
+        nvmtl_vk_buffer_destroy(out);
+        return nvmtl_vk_surface_vram(sid, plane, need, out);
+    }
+    NVMTLFamilyImport *fresh = [NVMTLFamilyImport new];
+    if (!fresh) return 0;
+    fresh->buffer = *out;
+    fresh->surface = (IOSurfaceRef)CFRetain(surf); // a retained IOSurface ID cannot be recycled
+    nvmtl_family_ref entry = {(__bridge_retained const void *)fresh, charge};
+    unsigned char gone[NVMTL_IC_SLOTS][NVMTL_IC_PAYLOAD];
+    const bool keep = nvmtl_ic_keep_warm();
+    unsigned n = 0; bool inserted = false, schedule = false;
     os_unfair_lock_lock(&g_ic_lock);
-    nvmtl_ic_insert(&g_ic, sid, need, cookie, (uintptr_t)out->buf, out, sizeof *out, evicted, &evicted_id);
+    bool current = g_ic_generation == tableGeneration;
+    if (current) {
+        const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (g_ic_publications != publications) {
+            // A newer import can have been installed after our last kernel read.
+            // Share a matching winner, otherwise re-resolve without displacing it.
+            nvmtl_backing_epoch winner = {0};
+            hit = nvmtl_ic_find_locked(sid, span, 0, &winner, now);
+            current = hit && nvmtl_ic_epoch_equal(before, winner);
+        } else hit = nvmtl_ic_find_locked(sid, span, generation, NULL, now);
+        if (current && !hit) {
+            // At capacity, a warm cache leaves new imports uncached until the pressure worker makes room.
+            while (!keep && charge > budget - g_ic_bytes && n < NVMTL_IC_SLOTS && nvmtl_ic_evict_idle(&g_ic, gone[n]))
+                g_ic_bytes -= nvmtl_ic_charge(gone[n++]);
+            if (charge <= budget - g_ic_bytes) {
+                unsigned char evicted[NVMTL_IC_PAYLOAD]; uintptr_t id = 0;
+                inserted = nvmtl_ic_insert(&g_ic, sid, span, generation, (uintptr_t)fresh->buffer.buf,
+                                           &entry, sizeof entry, keep ? NULL : evicted, &id);
+                if (id) { memcpy(gone[n++], evicted, sizeof evicted); g_ic_bytes -= nvmtl_ic_charge(evicted); }
+                if (inserted) {
+                    g_ic_publications++;
+                    (void)nvmtl_ic_release(&g_ic, (uintptr_t)fresh->buffer.buf, now, evicted);
+                    g_ic_bytes += charge;
+                    if (!g_ic_cleanup_scheduled) { schedule = true; g_ic_cleanup_scheduled = true; }
+                }
+            }
+        }
+    } else atomic_fetch_add(&g_ic_unknown, 1);
     os_unfair_lock_unlock(&g_ic_lock);
-    if (evicted_id) nvmtl_ic_destroy_all(&evicted, 1);
+    for (unsigned i = 0; i < n; i++) nvmtl_ic_destroy(gone[i]);
+    if (inserted) atomic_fetch_add(&g_ic_inserts, 1);
+    else CFRelease(entry.owner);
+    if (!current) return nvmtl_vk_surface_vram(sid, plane, need, out);
+    if (schedule) nvmtl_ic_schedule_cleanup(nvmtl_ic_idle_ns() + 1);
+    // If a concurrent caller published first, only 'fresh' owns the duplicate.
+    NVMTLFamilyImport *result = hit ?: fresh;
+    *out = result->buffer; *lease = result;
     return 0;
 }
-// A wrapper lets go of its buffer: 1 = the cache owns it now, 0 = it was never cached (destroy it).
-static int nvmtl_ic_put(nvk_buffer *b)
+
+// VT publishes the tag after the decoder's GPU fence and the kernel's atomic
+// publication of both planes. A CPU writer changes the IOSurface seed.
+static uint64_t nvmtl_decoded_generation(IOSurfaceRef surf, uint32_t seed)
 {
-    unsigned char gone[NVMTL_IC_PAYLOAD];
-    os_unfair_lock_lock(&g_ic_lock);
-    const int r = nvmtl_ic_release(&g_ic, (uintptr_t)b->buf, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), gone);
-    os_unfair_lock_unlock(&g_ic_lock);
-    if (r == 2) nvmtl_ic_destroy_all(&gone, 1);
-    if (r) memset(b, 0, sizeof *b);
-    return r != 0;
+    struct { uint32_t seed, reserved; uint64_t generation; } tag = {0};
+    CFTypeRef v = IOSurfaceCopyValue(surf, CFSTR("NVMTLDecodedFrameV1"));
+    if (v && CFGetTypeID(v) == CFDataGetTypeID() && CFDataGetLength(v) == sizeof tag)
+        CFDataGetBytes(v, CFRangeMake(0, sizeof tag), (UInt8 *)&tag);
+    if (v) CFRelease(v);
+    return !tag.reserved && tag.seed == seed ? tag.generation : 0;
+}
+
+static bool nvmtl_read_decoded_plane(NVMTLTexture *t)
+{
+    IOSurfaceRef surf = t->_surf;
+    const uint32_t plane = (uint32_t)t->_plane;
+    if (!surf || t->_vramOn || plane > 1 || IOSurfaceGetPlaneCount(surf) != 2) return false;
+    const uint32_t fmt = IOSurfaceGetPixelFormat(surf);
+    if (fmt != '420v' && fmt != '420f' && fmt != 'x420' && fmt != 'xf20') return false;
+    const uint32_t seed = IOSurfaceGetSeed(surf);
+    const uint64_t gen = nvmtl_decoded_generation(surf, seed);
+    if (gen && t->_decodedGeneration == gen && t->_surfSynced && t->_surfSeed == seed) return true;
+    if (t->_decodedGeneration) { t->_surfSynced = NO; t->_decodedGeneration = 0; }
+    if (!gen || ![t nvmtlSurfaceCopyable]) return false;
+    const uintptr_t base = (uintptr_t)IOSurfaceGetBaseAddress(surf);
+    const uintptr_t pb = (uintptr_t)IOSurfaceGetBaseAddressOfPlane(surf, plane);
+    const size_t row = IOSurfaceGetBytesPerRowOfPlane(surf, plane), bytes = IOSurfaceGetAllocSize(surf);
+    if (!base || pb < base || pb - base >= bytes || !row || row > UINT32_MAX ||
+        (pb - base) % 4 || !t->_i.bpp || row % t->_i.bpp || (uint64_t)t->_i.w * t->_i.bpp > row ||
+        t->_i.h > (bytes - (pb - base)) / row) return false;
+    nvk_buffer src;
+    // The NVK bridge forwards the plane selector verbatim; old accelerators reject it.
+    const uint32_t publishedPlane = 0x20000002u | plane; // nvrm_surfshare_abi.h: VIDEO_FRAME | VIDEO_READ
+    if (nvmtl_vk_surface_vram(IOSurfaceGetID(surf), publishedPlane, bytes, &src)) return false;
+    const int rc = nvmtl_vk_copy_buffer_to_image(t->_q, &src, pb - base, (uint32_t)row, &t->_i, 0, 0, t->_i.w, t->_i.h);
+    nvmtl_vk_buffer_destroy(&src);
+    if (rc || IOSurfaceGetSeed(surf) != seed || nvmtl_decoded_generation(surf, seed) != gen) return false;
+    t->_surfSeed = seed; t->_surfSynced = YES; t->_decodedGeneration = gen;
+    return true;
 }
 static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
                                       uint32_t vkf, uint32_t bpp, int a8, int stex)
@@ -1610,10 +1961,10 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
     if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_vk_surface_share_on()) {
         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
         if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
-            nvk_buffer vb;
-            if (!nvmtl_ic_get(surf, row * h, &vb)) {
+            nvk_buffer vb; NVMTLFamilyImport *lease = nil;
+            if (!nvmtl_ic_get(surf, (uint32_t)plane, row * h, &vb, &lease)) {
                 if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
-                    t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++;
+                    t->_vramBuf = vb; t->_familyImport = lease; t->_vramOn = YES; g_surf_vram++;
                     uint32_t seed = IOSurfaceGetSeed(surf);
                     int current = nvmtl_vram_tag_current(surf, 0, seed);
                     if (current) { t->_surfSeed = seed; t->_surfSynced = YES; }
@@ -1622,7 +1973,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
                               w, h, row, current ? ", already current (no upload)" : "", g_surf_vram, g_surf_private);
                     return 0;
                 }
-                if (!nvmtl_ic_put(&vb)) nvmtl_vk_buffer_destroy(&vb);
+                if (!lease) nvmtl_vk_buffer_destroy(&vb);
             }
         }
     }
@@ -1705,10 +2056,11 @@ static char nvmtl_surface_cache_key;
     if (nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex)) {
         nvlog("newTextureWithDescriptor:iosurface:plane: image create FAILED (%zux%zu)", w, h); return nil; }
     t->_q = nvmtl_device_queue();
-    t->_surf = surf; if (surf) { CFRetain(surf); t->_surfOwned = YES; t->_clientWritten = nvmtl_busy_foreign(surf, plane) != 0; }
+    t->_surf = surf; if (surf) { CFRetain(surf); t->_surfOwned = YES; }
     t->_plane = plane;
     t->_fmt = d.pixelFormat;
     t->_stex = t->_i.storage == 1;
+    t->_requestedSampleOnly = d.usage == MTLTextureUsageShaderRead;
     t->_usage = nvmtl_surface_usage(d.usage, t->_fbo, t->_stex);
     nvmtl_texture_desc_swizzle(t, d);
     if (key && !t->_vramOn) [cache setObject:t forKey:key];
@@ -2684,7 +3036,7 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
             @"lod_min_clamp":@(sd.lodMinClamp),@"lod_max_clamp":@(sd.lodMaxClamp),
             @"border_color":(@[@"TransparentBlack",@"OpaqueBlack",@"OpaqueWhite"])[MIN(NVMTL_SINCE(10.12, NSUInteger, sd.borderColor, 0),2u)],
             @"reduction":@"WeightedAverage",@"lod_bias":@0};
-        nvlog("pixel sampler: %s",s->_pixelState.description.UTF8String);
+        nvlog_pixel_sampler(s->_pixelState);
     }
     int linear = (sd.minFilter == MTLSamplerMinMagFilterLinear || sd.magFilter == MTLSamplerMinMagFilterLinear);
     int repeat = (sd.sAddressMode == MTLSamplerAddressModeRepeat);
@@ -3285,4 +3637,9 @@ static BOOL nvmtl_family_answer(NSInteger f, BOOL yes, const char *why)
 #import "NVMTLMetal4.m"
 #import "NVMTLVendorCompiler.m"
 #include "nvmtl_vk.c"
+static uintptr_t nvmtl_vk_import_device(void) { return (uintptr_t)g_dev; }
+static uint32_t nvmtl_vk_import_cookie(uint32_t sid)
+{
+    return g_dev && pnvk_surface_dirty ? pnvk_surface_dirty(g_dev, sid, NVRM_SS_PLANE_COOKIE) : NVRM_SS_OFF;
+}
 #import "NVMTLSass.m"

@@ -5,13 +5,13 @@
 // (MIT; docs/tasks.md M9).
 #pragma once
 #include "rm.h"
-#include "channel.h"
+#include "dec_copy.h"
 #include "av1parse.h"
 
 enum { AV1_SURFACES = 16 };       // 8 reference slots, the frame, its film-grain output, grain twins, frames held
 
 typedef struct {
-    Rm *rm; Chan chan;
+    Rm *rm; Chan chan; DecCopy copy;
     unsigned maxW, maxH;            // allocation size (pixels, multiple of 128)
     int bit_depth, bps;
     size_t pitch;                   // bytes

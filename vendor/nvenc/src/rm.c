@@ -53,7 +53,7 @@ int rm_esc(Rm *rm, io_connect_t conn, NvU32 cmd, void *data, size_t size)
 
 // our own handle range: RM generates handles from 0xcaf00000 for objects it creates inside our client (a channel
 // gets an internal channel group), so client-chosen handles must stay out of that range
-NvHandle rm_handle(Rm *rm) { return 0x4e560000u + rm->nextHandle++; }
+NvHandle rm_handle(Rm *rm) { return 0x4e560000u + __atomic_fetch_add(&rm->nextHandle, 1, __ATOMIC_RELAXED); }
 
 NV_STATUS rm_alloc(Rm *rm, NvHandle parent, NvHandle obj, NvU32 cls, void *params)
 {
@@ -151,6 +151,47 @@ void rm_unmap_cpu(Rm *rm, RmConn *conn)
     rm_conn_close(conn);
 }
 
+static NV_STATUS map_gpu(Rm *rm, RmMem *m, NvU64 align)
+{
+    NV_STATUS st;
+    NvU64 size = m->size;
+    bool sysmem = m->sysmem;
+    NV_MEMORY_ALLOCATION_PARAMS v = { .owner = rm->client, .type = NVOS32_TYPE_IMAGE,
+        .flags = NVOS32_ALLOC_FLAGS_VIRTUAL | (align ? NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE : 0),
+        .size = size, .alignment = align, .hVASpace = rm->vaspace };
+    m->hVirt = rm_handle(rm);
+    if ((st = rm_alloc(rm, rm->device, m->hVirt, NV50_MEMORY_VIRTUAL, &v))) { m->hVirt = 0; return st; }
+    NVOS46_PARAMETERS d = { .hClient = rm->client, .hDevice = rm->device, .hDma = m->hVirt, .hMemory = m->hPhys,
+        .offset = 0, .length = size,
+        .flags = DRF_DEF(OS46, _FLAGS, _PAGE_KIND, _VIRTUAL) |
+                 (sysmem ? DRF_DEF(OS46, _FLAGS, _CACHE_SNOOP, _ENABLE) : DRF_DEF(OS46, _FLAGS, _CACHE_SNOOP, _DISABLE)) };
+    if (rm_esc(rm, rm->ctl, NV_ESC_RM_MAP_MEMORY_DMA, &d, sizeof d) || d.status) {
+        if (rm->verbose) fprintf(stderr, "rm: map dma -> 0x%x\n", d.status);
+        return d.status ? d.status : NV_ERR_GENERIC;
+    }
+    // hDma is a virtual memory object, so RM returns the absolute GPU address in dmaOffset (== the object's offset
+    // for a mapping at its start)
+    m->gpu = d.dmaOffset;
+    if (rm->verbose) fprintf(stderr, "rm: %s %llu KB at GPU 0x%llx (virtual object at 0x%llx)\n", sysmem ? "sysmem" : "vidmem",
+                             (unsigned long long)(size >> 10), (unsigned long long)d.dmaOffset, (unsigned long long)v.offset);
+    return NV_OK;
+}
+
+NV_STATUS rm_mem_dup(Rm *rm, RmMem *m, NvHandle client, NvHandle memory, NvU64 bytes)
+{
+    memset(m, 0, sizeof *m);
+    if (!client || !memory || !bytes || (bytes & 4095)) return NV_ERR_INVALID_ARGUMENT;
+    NVOS55_PARAMETERS p = { .hClient = rm->client, .hParent = rm->device,
+                            .hClientSrc = client, .hObjectSrc = memory };
+    if (rm_esc(rm, rm->ctl, NV_ESC_RM_DUP_OBJECT, &p, sizeof p) || p.status || !p.hObject)
+        return p.status ? p.status : NV_ERR_GENERIC;
+    m->hPhys = p.hObject;
+    m->size = bytes;
+    NV_STATUS st = map_gpu(rm, m, 4096);
+    if (st) rm_mem_free(rm, m);
+    return st;
+}
+
 NV_STATUS rm_mem_alloc(Rm *rm, RmMem *m, NvU64 size, NvU64 align, bool sysmem, bool cpuMap, bool gpuMap)
 {
     memset(m, 0, sizeof *m); m->map.fd = -1;
@@ -164,26 +205,7 @@ NV_STATUS rm_mem_alloc(Rm *rm, RmMem *m, NvU64 size, NvU64 align, bool sysmem, b
     NV_STATUS st = rm_alloc(rm, rm->device, m->hPhys, sysmem ? NV01_MEMORY_SYSTEM : NV01_MEMORY_LOCAL_USER, &p);
     if (st) { m->hPhys = 0; return st; }
     if (cpuMap && (st = rm_map_cpu(rm, rm->device, m->hPhys, size, sysmem, &m->map, &m->cpu))) return st;
-    if (gpuMap) {
-        NV_MEMORY_ALLOCATION_PARAMS v = { .owner = rm->client, .type = NVOS32_TYPE_IMAGE,
-            .flags = NVOS32_ALLOC_FLAGS_VIRTUAL | (align ? NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE : 0),
-            .size = size, .alignment = align, .hVASpace = rm->vaspace };
-        m->hVirt = rm_handle(rm);
-        if ((st = rm_alloc(rm, rm->device, m->hVirt, NV50_MEMORY_VIRTUAL, &v))) { m->hVirt = 0; return st; }
-        NVOS46_PARAMETERS d = { .hClient = rm->client, .hDevice = rm->device, .hDma = m->hVirt, .hMemory = m->hPhys,
-            .offset = 0, .length = size,
-            .flags = DRF_DEF(OS46, _FLAGS, _PAGE_KIND, _VIRTUAL) |
-                     (sysmem ? DRF_DEF(OS46, _FLAGS, _CACHE_SNOOP, _ENABLE) : DRF_DEF(OS46, _FLAGS, _CACHE_SNOOP, _DISABLE)) };
-        if (rm_esc(rm, rm->ctl, NV_ESC_RM_MAP_MEMORY_DMA, &d, sizeof d) || d.status) {
-            if (rm->verbose) fprintf(stderr, "rm: map dma -> 0x%x\n", d.status);
-            return d.status ? d.status : NV_ERR_GENERIC;
-        }
-        // hDma is a virtual memory object, so RM returns the absolute GPU address in dmaOffset (== the object's offset
-        // for a mapping at its start)
-        m->gpu = d.dmaOffset;
-        if (rm->verbose) fprintf(stderr, "rm: %s %llu KB at GPU 0x%llx (virtual object at 0x%llx)\n", sysmem ? "sysmem" : "vidmem",
-                                 (unsigned long long)(size >> 10), (unsigned long long)d.dmaOffset, (unsigned long long)v.offset);
-    }
+    if (gpuMap) return map_gpu(rm, m, align);
     return NV_OK;
 }
 

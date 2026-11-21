@@ -46,7 +46,7 @@ static UInt64 readFlipEpoch() { return (UInt64)gFlipEpoch; }
 static void advanceFlipEpoch() { if (gFlipEpoch != kFlipEpochLimit) gFlipEpoch++; }
 
 struct NVFlipEntry { struct NvKmsKapiMemory *mem; struct NvKmsKapiSurface *surf;
-                     unsigned w, h, pitch; UInt64 epoch, cookie; struct NvKmsKapiMemory *pin; };
+                     unsigned w, h, pitch; UInt64 epoch, cookie; struct NvKmsKapiMemory *pin; unsigned format; };
 struct FB {
     NVFlipEntry fFlipCache[16] = {};
     IOSimpleLock *fFlipCacheLock = nullptr;
@@ -54,7 +54,7 @@ struct FB {
     struct NvKmsKapiSurface *fSurf = nullptr;
     // Run the lifted lookup region exactly and return what it resolved the surface to.
     struct NvKmsKapiSurface *lookup(struct NvKmsKapiMemory *mem, UInt64 cookie,
-                                    unsigned pitch, unsigned w, unsigned h) {
+                                    unsigned pitch, unsigned w, unsigned h, unsigned format = 8) {
         struct NvKmsKapiSurface *surf = mem ? nullptr : fSurf;
         LOOKUP_REGION
         return surf;
@@ -65,12 +65,14 @@ static struct NvKmsKapiMemory *const M = (struct NvKmsKapiMemory *)0x1000; // re
 static struct NvKmsKapiSurface *const S_OLD = (struct NvKmsKapiSurface *)0xA000;
 
 static void seed(FB &fb) {
-    fb.fFlipCache[0] = { M, S_OLD, 1920, 1080, 7680, readFlipEpoch(), 7u, M };
+    fb.fFlipCache[0] = { M, S_OLD, 1920, 1080, 7680, readFlipEpoch(), 7u, M, 8 };
     fb.fFlipCacheN = 1;
 }
 int main() {
     // Same epoch: a genuine cache hit still works (the fix must not break caching).
     { FB fb; seed(fb); assert(fb.lookup(M, 7u, 7680, 1920, 1080) == S_OLD); }
+    // Two packed formats can have identical pitch and geometry.
+    { FB fb; seed(fb); assert(fb.lookup(M, 7u, 7680, 1920, 1080, 10) == nullptr); }
     // After a free+realloc at the same address (epoch advanced), the stale surface must NOT be returned.
     { FB fb; seed(fb); advanceFlipEpoch();
       struct NvKmsKapiSurface *got = fb.lookup(M, 7u, 7680, 1920, 1080);

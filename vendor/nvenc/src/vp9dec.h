@@ -5,13 +5,13 @@
 // what the headers do not say is in docs/tasks.md (M10).
 #pragma once
 #include "rm.h"
-#include "channel.h"
+#include "dec_copy.h"
 #include "vp9parse.h"
 
 enum { VP9_SURFACES = 12 };         // 8 reference slots + the frame being decoded + frames the caller still holds
 
 typedef struct {
-    Rm *rm; Chan chan;
+    Rm *rm; Chan chan; DecCopy copy;
     unsigned maxW, maxH;            // allocation size (pixels, multiple of 64)
     int bit_depth, bps;             // the session's bit depth; bytes per sample (1, or 2 for 10/12-bit)
     size_t pitch;                   // bytes

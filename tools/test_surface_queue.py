@@ -9,6 +9,7 @@ helpers=source[start:end]
 fixture=r'''
 #import <Foundation/Foundation.h>
 #include <assert.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <objc/runtime.h>
@@ -19,11 +20,15 @@ fixture=r'''
 // default for the first arms; 0 = taken), and every mark is logged as "id:pending"
 static const char *test_progname(void){return "WindowServer";}
 #define getprogname() test_progname()
-static int markAnswer=-1; static NSMutableArray *markLog;
+static int markAnswer=-1; static BOOL refuseSurface; static NSMutableArray *markLog;
 // whether NVAccel publishes NVAccelSurfaceWait (its page-off waits for a pending surface): KERNEL_HALF=1 or 0
 static int nvmtl_vk_accel_surface_wait(void){return getenv("KERNEL_HALF")&&!strcmp(getenv("KERNEL_HALF"),"1");}
-static int nvmtl_vk_surface_gpu_mark(uint32_t sid,int pending){if(sid&&markLog)[markLog addObject:[NSString stringWithFormat:@"%u:%d",sid,pending]];return markAnswer;}
+static int nvmtl_vk_surface_gpu_mark(uint32_t sid,int pending){if(sid&&markLog)[markLog addObject:[NSString stringWithFormat:@"%u:%d",sid,pending]];return sid && pending && refuseSurface ? -1 : markAnswer;}
 static void nvlog(const char *f,...){(void)f;}
+static BOOL nvmtl_ws_fence_stats_on(void) { return NO; }
+static void nvmtl_ws_log_slow_release(uint32_t sid, uint64_t mark, uint64_t notify, uint64_t ready, id part,
+                                      uint64_t entered, uint64_t lockStart, uint64_t locked, const char *path,
+                                      BOOL accepted) {}
 struct __IOSurface {unsigned id,seed;};
 // the kernel dirty mark makes the surface device-current, and IOSurface moves the seed when that happens (measured on
 // Apple's driver: one seed step per GPU write); dirtyBumpsSeed models that, dirtyCalls counts the marks
@@ -34,15 +39,16 @@ static void nvtrace(const char *f,...){(void)f;}
 // by test_surface_publication.py
 static int busyWrites;
 static void nvmtl_busy_write(IOSurfaceRef s,NSUInteger p,uint64_t seq,int done){(void)s;(void)p;(void)seq;(void)done;busyWrites++;}
+static void nvmtl_busy_notify_done(void) { assert(!"WindowServer must not post app completion notifications"); }
 static unsigned IOSurfaceGetID(IOSurfaceRef s){return s->id;}
 static unsigned IOSurfaceGetSeed(IOSurfaceRef s){return s->seed;}
 @class NVMTLCommandBuffer;
-@interface NVMTLTexture:NSObject{@public IOSurfaceRef _surf; BOOL _vramOn;NSUInteger _plane;}@end
+@interface NVMTLTexture:NSObject{@public IOSurfaceRef _surf; BOOL _vramOn;NVMTLTexture *_parent;NSUInteger _plane;}@end
 @implementation NVMTLTexture
 - (BOOL)nvmtlSurfaceOut{return YES;}
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied{(void)dirtied;return YES;}
 @end
-@interface NVMTLCommandBuffer:NSObject{@public id _queue;NSArray *_parts;NSDictionary *_busyMarks;}@end
+@interface NVMTLCommandBuffer:NSObject{@public id _queue;NSArray *_parts;NSDictionary *_busyMarks; NSSet *_surfDirty;BOOL _wsWaitForCompletion;}@end
 @implementation NVMTLCommandBuffer @end
 @interface NVMTLSubmissionPart:NSObject{@public NSSet *surfaces;}@end
 @implementation NVMTLSubmissionPart @end
@@ -55,26 +61,33 @@ int main(void){@autoreleasepool{
  NVMTLTexture*t=texture((IOSurfaceRef)&surface),*alias=texture((IOSurfaceRef)&surface);
  NSObject*q=[NSObject new],*other=[NSObject new];
  NVMTLCommandBuffer*a=writer(q,t),*b=writer(q,t),*c=writer(other,t);
- assert(!nvmtl_surface_pending_write(b,t));
+ assert(!nvmtl_surface_pending_write(b,t,NULL));
  nvmtl_surface_register_writes(a);
- assert(nvmtl_surface_pending_write(b,t));
- assert(nvmtl_surface_pending_write(b,alias));
- assert(!nvmtl_surface_pending_write(a,t));
- assert(nvmtl_surface_pending_write(c,t));
+ NVMTLCommandBuffer *consumer = [NVMTLCommandBuffer new]; consumer->_queue = other;
+ // A pending GPU writer excludes a CPU snapshot even with a different texture wrapper and queue.
+ BOOL anyWriter=NO; assert(nvmtl_surface_pending_write(consumer,alias,&anyWriter) && anyWriter);
+ assert(nvmtl_surface_pending_write(b,t,NULL));
+ assert(nvmtl_surface_pending_write(b,alias,NULL));
+ assert(!nvmtl_surface_pending_write(a,t,NULL));
+ assert(nvmtl_surface_pending_write(c,t,NULL));
  struct {unsigned id,seed;} otherSurface={8,7};NVMTLTexture *unrelated=texture((IOSurfaceRef)&otherSurface);
- assert(!nvmtl_surface_pending_write(c,unrelated));
- surface.seed++;assert(!nvmtl_surface_pending_write(b,t));surface.seed--;
- alias->_vramOn=NO;assert(!nvmtl_surface_pending_write(b,alias));alias->_vramOn=YES;
- t->_vramOn=NO;assert(nvmtl_surface_pending_write(b,t));assert(!nvmtl_surface_pending_write(b,alias));t->_vramOn=YES;
- alias->_plane=1;assert(!nvmtl_surface_pending_write(b,alias));alias->_plane=0;
+ assert(!nvmtl_surface_pending_write(c,unrelated,NULL));
+ surface.seed++;assert(!nvmtl_surface_pending_write(b,t,NULL));surface.seed--;
+ alias->_vramOn=NO;assert(!nvmtl_surface_pending_write(b,alias,NULL));alias->_vramOn=YES;
+ t->_vramOn=NO;assert(nvmtl_surface_pending_write(b,t,NULL));assert(!nvmtl_surface_pending_write(b,alias,NULL));t->_vramOn=YES;
+ alias->_plane=1;assert(!nvmtl_surface_pending_write(b,alias,NULL));alias->_plane=0;
  nvmtl_surface_register_writes(b);nvmtl_surface_finish_writes(a);
- assert(nvmtl_surface_pending_write(a,t));
- nvmtl_surface_finish_writes(b);assert(!nvmtl_surface_pending_write(a,t));
+ assert(nvmtl_surface_pending_write(a,t,NULL));
+ nvmtl_surface_finish_writes(b);assert(!nvmtl_surface_pending_write(a,t,NULL));
+ anyWriter=NO; assert(!nvmtl_surface_pending_write(consumer,alias,&anyWriter) && !anyWriter);
+ consumer->_surfDirty=[NSSet setWithObject:t]; assert(nvmtl_sample_has_recorded_writer(consumer,alias));
+ consumer->_surfDirty=nil; consumer->_parts=a->_parts; assert(nvmtl_sample_has_recorded_writer(consumer,alias));
+ assert(!nvmtl_sample_has_recorded_writer(consumer,unrelated));
  assert(nvmtl_surface_writers.count==0);
- for(unsigned i=0;i<1000;i++){nvmtl_surface_register_writes(a);assert(nvmtl_surface_pending_write(b,t));nvmtl_surface_finish_writes(a);assert(nvmtl_surface_writers.count==0);}
+ for(unsigned i=0;i<1000;i++){nvmtl_surface_register_writes(a);assert(nvmtl_surface_pending_write(b,t,NULL));nvmtl_surface_finish_writes(a);assert(nvmtl_surface_writers.count==0);}
  __weak NVMTLCommandBuffer *weak;
  @autoreleasepool{NVMTLCommandBuffer*ephemeral=writer(q,t);weak=ephemeral;nvmtl_surface_register_writes(ephemeral);}
- assert(!weak);assert(!nvmtl_surface_pending_write(b,t));
+ assert(!weak);assert(!nvmtl_surface_pending_write(b,t,NULL));
  nvmtl_surface_finish_writes(b);assert(nvmtl_surface_writers.count==0);
  // WindowServer with an accelerator that takes the marks. The commit runs in production order (nvmtlSubmitWithEvents,
  // checked from its source below): the kernel marks, then the pending-write records.
@@ -89,22 +102,22 @@ int main(void){@autoreleasepool{
   // the capture fix: device-current at commit, which moves the seed, and the record must be stamped after that move,
   // or the next command buffer reads the surface as if its write had landed and imports the CPU copy over the GPU's
   assert(dirtyCalls==1&&surface.seed==seed0+1);
-  assert(nvmtl_surface_pending_write(w2,t));
+  assert(nvmtl_surface_pending_write(w2,t,NULL));
  }else{
   // an accelerator whose page-off does not wait: nothing is marked newest at commit (a CPU lock would page off a
   // surface still being drawn); the record is stamped as before
   assert(dirtyCalls==0&&surface.seed==seed0);
-  assert(nvmtl_surface_pending_write(w2,t));
+  assert(nvmtl_surface_pending_write(w2,t,NULL));
  }
  nvmtl_surface_finish_writes(w1);
- assert([markLog.lastObject isEqual:@"4:0"]&&!nvmtl_surface_pending_write(w2,t));
+ assert([markLog.lastObject isEqual:@"4:0"]&&!nvmtl_surface_pending_write(w2,t,NULL));
  // a surface without a shared VRAM copy is never marked newest at commit, and its record is stamped the same way
  t->_vramOn=NO;dirtyCalls=0;[markLog removeAllObjects];const unsigned seed1=surface.seed;
  COMMIT(w1);
- assert(dirtyCalls==0&&surface.seed==seed1&&[markLog containsObject:@"4:1"]&&nvmtl_surface_pending_write(w2,t));
+ assert(dirtyCalls==0&&surface.seed==seed1&&[markLog containsObject:@"4:1"]&&nvmtl_surface_pending_write(w2,t,NULL));
  nvmtl_surface_finish_writes(w1);t->_vramOn=YES;
  // a CPU write after the commit still invalidates the record (later CPU edits import)
- COMMIT(w1);surface.seed++;assert(!nvmtl_surface_pending_write(w2,t));nvmtl_surface_finish_writes(w1);
+ COMMIT(w1);surface.seed++;assert(!nvmtl_surface_pending_write(w2,t,NULL));nvmtl_surface_finish_writes(w1);
  assert(nvmtl_surface_writers.count==0);
  // two command buffers in flight write the same surface: the kernel has one pending bit, so the older one finishing
  // first must not release it while the newer one still writes
@@ -118,6 +131,11 @@ int main(void){@autoreleasepool{
  nvmtl_surface_finish_writes(w2);
  assert([markLog.lastObject isEqual:@"4:0"]&&[nvmtl_ws_pending_holds countForObject:@4]==0);
  assert(nvmtl_surface_writers.count==0&&!nvmtl_ws_deferred.count);
+ // A successful SID-0 probe cannot cover a real pending mark refused later.
+ refuseSurface=YES; COMMIT(w1); assert(w1->_wsWaitForCompletion);
+ nvmtl_surface_finish_writes(w1);
+ refuseSurface=NO; COMMIT(w1); assert(!w1->_wsWaitForCompletion);
+ nvmtl_surface_finish_writes(w1);
  printf("PASS (kernel half %s): aliases, CPU seeds, queues, planes, private backing, latest writer, weak lifetime, 1000 cleanup "
         "cycles, WindowServer commit: %s, CPU edits still import, overlapping writers release the kernel mark once, with "
         "the last of them\n", half?"present":"absent",

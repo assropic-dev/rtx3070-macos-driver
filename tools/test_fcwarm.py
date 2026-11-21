@@ -12,8 +12,9 @@ and the warm-up) out of NVMTLLibraryLoad.m against the real libnvmtl_translate.d
   update  every cache file deleted (a new translator build sweeps them), records kept
   boot 2  the caller asks for ONE set; the other four must appear in the background, while one never recorded must not
   ref     a fresh cache, each set translated live on its own: names and bytes must equal boot 2's warmed files
-  join    with the files gone again, a second set asked for right after the first is read or joined, never translated
-  timing  five sets asked for at once: one live miss and the rest joined, against five misses without the warm-up
+  library the library's AIR text alone starts replay before a specialization request
+  queued  demand can translate a queued variant while the replay workers are unavailable
+  timing  five sets requested in succession, with and without recorded replay
   off     NVMTL_FCWARM_OFF=1: boot 2 warms nothing (the control that must fire)
 
 usage: test_fcwarm.py <libnvmtl_translate.dylib> <fixed_frag .ll> <sets file: idx:hex,... per line> [repo root]"""
@@ -46,6 +47,8 @@ def cut(start, end):
 parts = [
     cut("static _Atomic unsigned long gSpvHit, gSpvMiss, gSpvStored;", "static _Atomic unsigned long long gSpvAdded;"),
     cut("@interface NVMTLAirDigest : NSObject", "static BOOL nvmtl_air_unroll_wanted(NSData *air);"),
+    cut("typedef int (*nvmtl_spec_fn)", "static nvmtl_refl_fn xlate_refl;"),
+    cut("static _Atomic unsigned long gCacheRefused, gCacheSkippedLost;", "// ---- one translation per module"),
     cut("static __thread int g_fc_expect_link;", "static int nvmtl_reflect_air("),
 ]
 HARNESS = r'''
@@ -62,6 +65,7 @@ HARNESS = r'''
 #include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
+#include "nvmtl_cache_file.h"
 #define nvlog(...) (fprintf(stderr, __VA_ARGS__), fputc('\n', stderr))
 typedef int (*nvmtl_fc_fn)(const char *ll, const char *stage, const uint32_t *idx, const uint32_t *sizes,
                            const uint8_t *const *payloads, size_t n, uint8_t **out, size_t *out_len, char *err, size_t err_len);
@@ -69,6 +73,7 @@ typedef void (*nvmtl_free_fn)(uint8_t *p, size_t len);
 static nvmtl_fc_fn xlate_fc;
 static nvmtl_free_fn xlate_free;
 static int nvmtl_xlate_ready(void) { return xlate_fc != NULL; }
+static int nvmtl_vk_lost(void) { return 0; }
 static char gXlateTag[80] = "testbuild";
 // the cache folder and file names: the plugin's naming, in a folder the test chooses
 static NSString *nvmtl_spvcache_dir(void) { return @(getenv("TEST_CACHE")); }
@@ -98,6 +103,13 @@ static NSArray *test_sets(const char *file) {
     }
     return out;
 }
+static nvmtl_fc_fn test_translate;
+static int test_count_translate(const char *ll, const char *stage, const uint32_t *idx, const uint32_t *sizes,
+                                const uint8_t *const *payloads, size_t n, uint8_t **out, size_t *out_len,
+                                char *err, size_t err_len) {
+    fputs("ACTUAL TRANSLATION\n", stderr);
+    return test_translate(ll, stage, idx, sizes, payloads, n, out, out_len, err, err_len);
+}
 // what the plugin's newFunctionWithName:constantValues: hands over: the dictionary plus packed index/size/payload arrays
 static NSData *test_live(NSString *ll, NSDictionary *c, double *ms) {
     size_t n = c.count, k = 0;
@@ -109,31 +121,39 @@ static NSData *test_live(NSString *ll, NSDictionary *c, double *ms) {
     }
     NSString *e = nil;
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-    NSData *d = nvmtl_translate_with_fc_cached(ll, @"fragment", @"fixed_frag_lph_cpf", c, idx, sz, pay, n, &e);
+    const char *entry = getenv("TEST_ENTRY");
+    NSData *d = nvmtl_translate_with_fc_cached(ll, @"fragment", entry ? @(entry) : @"fixed_frag_lph_cpf", c, idx, sz, pay, n, &e);
     if (ms) *ms = (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6;
     if (!d) fprintf(stderr, "translate failed: %s\n", e.UTF8String);
     return d;
 }
 static void test_wait_warm(void) {
-    for (int i = 0; i < 1200; i++) {
-        os_unfair_lock_lock(&gFcWarmLock);
-        const NSUInteger busy = gFcWarmInFlight.count;
-        os_unfair_lock_unlock(&gFcWarmLock);
-        if (!busy) break;
-        usleep(100000);
-    }
+    dispatch_sync(nvmtl_fcwarm_scan_queue(), ^{});
+    [nvmtl_fcwarm_queue() waitUntilAllOperationsAreFinished];
     nvmtl_cache_io_drain();
 }
 int main(int argc, char **argv) {
     @autoreleasepool {
         void *h = dlopen(getenv("TEST_LIB"), RTLD_NOW);
         if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 2; }
-        xlate_fc = (nvmtl_fc_fn)dlsym(h, "nvmtl_translate_fc"); xlate_free = (nvmtl_free_fn)dlsym(h, "nvmtl_translate_free");
+        test_translate = (nvmtl_fc_fn)dlsym(h, "nvmtl_translate_fc"); xlate_free = (nvmtl_free_fn)dlsym(h, "nvmtl_translate_free");
+        if (!test_translate) return 2;
+        xlate_fc = test_count_translate;
         NSString *ll = [NSString stringWithContentsOfFile:@(getenv("TEST_LL")) encoding:NSUTF8StringEncoding error:NULL];
         NSArray *sets = test_sets(getenv("TEST_SETS"));
-        // argv: a list of set numbers to ask for, in order; "w" waits for the warm-up to finish
+        // argv: set numbers, l/m to load matching/modified AIR, q/r to pause/resume replay workers, w to wait
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "w")) { test_wait_warm(); continue; }
+            if (!strcmp(argv[i], "l") || !strcmp(argv[i], "m")) {
+                NSString *air = *argv[i] == 'l' ? ll : [ll stringByAppendingString:@"\n; changed AIR\n"];
+                nvmtl_fcwarm_library(@{@"shader":air});
+                dispatch_sync(nvmtl_fcwarm_scan_queue(), ^{});
+                continue;
+            }
+            if (!strcmp(argv[i], "q") || !strcmp(argv[i], "r")) {
+                nvmtl_fcwarm_queue().suspended = *argv[i] == 'q';
+                continue;
+            }
             double ms = 0; NSData *d = test_live(ll, sets[(NSUInteger)atoi(argv[i])], &ms);
             printf("ASKED %s %lu B %.0f ms\n", argv[i], (unsigned long)d.length, ms);
         }
@@ -145,7 +165,8 @@ int main(int argc, char **argv) {
 
 work = pathlib.Path(tempfile.mkdtemp(prefix="fcwarm-"))
 (work / "t.m").write_text(HARNESS)
-cc = subprocess.run(["clang", "-fobjc-arc", "-O1", "-w", "-framework", "Foundation", str(work / "t.m"), "-o", str(work / "t")],
+cc = subprocess.run(["clang", "-fobjc-arc", "-O1", "-w", "-I", str(root / "plugin"),
+                     "-framework", "Foundation", str(work / "t.m"), "-o", str(work / "t")],
                     capture_output=True, text=True)
 arm("the production warm-up and cache code compile out of NVMTLLibraryLoad.m", cc.returncode == 0, cc.stderr)
 if cc.returncode:
@@ -191,13 +212,31 @@ arm("negative control: a set nobody recorded (5) is not warmed", not (set(ref["5
 diff_key = len({next(iter(ref[k])) for k in ("1", "2", "3", "4", "5")}) == 5
 arm("negative control: a different constant set is a different cache file", diff_key, ref)
 
-# join: records present, no files; ask for 0 then 1 at once - 1 is already running in the background
+# Records present, no files: the second request may hit cache, join an active worker or claim queued work.
 for f in A.glob("*.c3.spv"):
     f.unlink()
 p, _ = boot(A, ["0", "1"])
-arm("a sibling asked for right after the first set is read or joined, never translated again",
-    p.stderr.count("fc cache: miss") == 1 and ("fc cache: HIT" in p.stderr or "JOINED" in p.stderr), p.stderr[-800:])
+arm("a sibling requested during replay is translated only once",
+    p.stderr.count("ACTUAL TRANSLATION") == 5, p.stderr[-800:])
 arm("  and gets the same bytes", files(A).items() >= {next(iter(ref["1"].items()))}, files(A))
+
+for label, asks, expected in (
+    ("library", ["l", "w"], boot2),
+    ("changed", ["m", "w"], {}),
+    ("queued", ["q", "l", "1", "r", "w"], boot2),
+):
+    cache = work / label
+    cache.mkdir()
+    shutil.copy(A / ".fcwarm.v1", cache / ".fcwarm.v1")
+    p, _ = boot(cache, asks)
+    arm(f"{label}: cache files match exact recorded AIR and constant bytes", p.returncode == 0 and files(cache) == expected,
+        p.stdout + p.stderr)
+    if label == "library":
+        arm("  library replay populated all five files before the caller asked", "ASKED" not in p.stdout and
+            p.stderr.count("ACTUAL TRANSLATION") == 5, p.stderr)
+    if label == "queued":
+        arm("  demand bypasses a paused worker without translating twice", "ASKED 1" in p.stdout and
+            "JOINED" not in p.stderr and p.stderr.count("ACTUAL TRANSLATION") == 5, p.stderr)
 
 shutil.copy(A / ".fcwarm.v1", C / ".fcwarm.v1")
 p, _ = boot(C, ["0"], {"NVMTL_FCWARM_OFF": "1"})
@@ -210,8 +249,8 @@ E = work / "E"; E.mkdir()
 p_c, _ = boot(E, ["0", "1", "2", "3", "4"], {"NVMTL_FCWARM_OFF": "1"})
 asked = lambda out: sum(float(l.split()[-2]) for l in out.splitlines() if l.startswith("ASKED"))
 w, c = asked(p_w.stdout), asked(p_c.stdout)
-arm("asking for all five at once: one live miss, the rest joined or read", p_w.stderr.count("fc cache: miss") == 1
-    and "JOINED the background translation" in p_w.stderr, p_w.stderr[-800:])
+arm("asking for all five during replay translates each only once", p_w.stderr.count("ACTUAL TRANSLATION") == 5,
+    p_w.stderr[-800:])
 arm("control: without the warm-up all five are live misses", p_c.stderr.count("fc cache: miss") == 5, p_c.stderr[-400:])
 print(f"     asking thread, five cold sets: {c:.0f} ms without warm-up, {w:.0f} ms with records ({p_w.stdout.count('ASKED')} asked)")
 arm("the asking thread waits less with the warm-up", w < c, (w, c))

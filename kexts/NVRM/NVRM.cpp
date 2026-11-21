@@ -436,10 +436,15 @@ private:
     static IOReturn sBindFd(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sRetired(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sWaitEvent(OSObject *target, void *reference, IOExternalMethodArguments *args);
+    static IOReturn sTraceEvent(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sCaps(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sForgetToken(OSObject *target, void *reference, IOExternalMethodArguments *args);
 public:
     volatile UInt32 fEvtSeq = 0;
+    // Allocated only when a client requests selector 9 on its own event connection.
+    IOSimpleLock *fTraceEventLock = nullptr;
+    UInt32 fTraceArmed = 0, fTracePostedSeq = 0;
+    UInt64 fTracePostedTicks = 0;
     UInt32 fEvtMagic = 0x4e564556u;
     static NVRMUserClient *fromNvfp(nv_file_private_t *p);
     int  pid() const { return fPid; }
@@ -2594,6 +2599,7 @@ void NVRMUserClient::free(void)
     if (fMapLock) IOLockUnlock(fMapLock);
     if (fGate) { IOLockFree(fGate); fGate = nullptr; }
     if (fMapLock) { IOLockFree(fMapLock); fMapLock = nullptr; }
+    if (fTraceEventLock) IOSimpleLockFree(fTraceEventLock);
     super::free();
 }
 // Token mappings - many CPU mappings on one connection.
@@ -2772,6 +2778,7 @@ IOReturn NVRMUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
         { sWaitEvent, 2, 0, 1, 0 },
         { sCaps, 0, 0, 1, 0 },
         { sForgetToken, 1, 0, 0, 0 },
+        { sTraceEvent, 1, 0, 2, 0 },
     };
     if (selector >= sizeof tbl / sizeof tbl[0]) return kIOReturnBadArgument;
     IOExternalMethodDispatch d = tbl[selector];
@@ -2814,7 +2821,22 @@ extern "C" void NV_API_CALL nv_post_event(nv_event_t *event, NvHandle hEvent, Nv
 {
     const SInt64 k = OSIncrementAtomic64(&gNvEvtPosts);
     NVRMUserClient *c = event ? NVRMUserClient::fromNvfp(event->nvfp) : NULL;
-    if (c) { OSIncrementAtomic64(&gNvEvtMatched); OSIncrementAtomic((volatile SInt32 *)&c->fEvtSeq); thread_wakeup((event_t)&c->fEvtSeq); }
+    if (c) {
+        OSIncrementAtomic64(&gNvEvtMatched);
+        IOSimpleLock *lock = __atomic_load_n(&c->fTraceArmed, __ATOMIC_ACQUIRE) ? c->fTraceEventLock : nullptr;
+        if (lock) {
+            IOInterruptState state = IOSimpleLockLockDisableInterrupt(lock);
+            const UInt32 seq = (UInt32)OSIncrementAtomic((volatile SInt32 *)&c->fEvtSeq) + 1u;
+            if (__atomic_load_n(&c->fTraceArmed, __ATOMIC_RELAXED)) {
+                c->fTracePostedSeq = seq;
+                c->fTracePostedTicks = mach_absolute_time();
+            }
+            IOSimpleLockUnlockEnableInterrupt(lock, state);
+        } else {
+            OSIncrementAtomic((volatile SInt32 *)&c->fEvtSeq);
+        }
+        thread_wakeup((event_t)&c->fEvtSeq);
+    }
     if (k == 999 || k == 99999 || k == 999999)
         OSReportWithBacktrace("NVRM-xnu: post #%lld caller chain (nv_post_event at %p, isr-thread %d)", (long long)k + 1,
                               (void *)&nv_post_event, current_thread() == nv_xnu_isr_thread);
@@ -2822,6 +2844,42 @@ extern "C" void NV_API_CALL nv_post_event(nv_event_t *event, NvHandle hEvent, Nv
         kprintf("NVRM-xnu: nv_post_event #%lld hEvent 0x%x index %u -> %s | matched %lld, waits %lld, slept %lld\n",
                 (long long)k + 1, hEvent, index, c ? "connection woken" : "no connection", (long long)gNvEvtMatched,
                 (long long)gNvEvtWaits, (long long)gNvEvtSlept);
+}
+// A snapshot of the last observed RM post on this connection. No kernel object
+// address or GPU fence is exported. Input 1 arms one observation; input 0
+// reads and ends it. Concurrent traced waits on the same connection may overlap.
+// A zero time means no post was captured. Selector 6 keeps its original ABI.
+IOReturn NVRMUserClient::sTraceEvent(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+    NVRMUserClient *me = OSDynamicCast(NVRMUserClient, target);
+    if (!me) return kIOReturnNotAttached;
+    const uint64_t arm = args->scalarInput[0];
+    if (arm > 1) return kIOReturnBadArgument;
+    IOSimpleLock *lock = __atomic_load_n(&me->fTraceEventLock, __ATOMIC_ACQUIRE);
+    if (!lock) {
+        if (!arm) return kIOReturnNotReady;
+        IOSimpleLock *fresh = IOSimpleLockAlloc();
+        if (!fresh) return kIOReturnNoMemory;
+        if (__atomic_compare_exchange_n(&me->fTraceEventLock, &lock, fresh, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            lock = fresh;
+        else IOSimpleLockFree(fresh);
+    }
+    IOInterruptState state = IOSimpleLockLockDisableInterrupt(lock);
+    UInt32 active = __atomic_load_n(&me->fTraceArmed, __ATOMIC_RELAXED);
+    if ((arm && active >= (UInt32)kNvEvtMaxSleepers) || (!arm && !active)) {
+        IOSimpleLockUnlockEnableInterrupt(lock, state);
+        return kIOReturnBadArgument;
+    }
+    if (arm && !active) { me->fTracePostedSeq = 0; me->fTracePostedTicks = 0; }
+    __atomic_store_n(&me->fTraceArmed, arm ? active + 1 : active - 1, __ATOMIC_RELEASE);
+    const UInt32 seq = me->fTracePostedSeq;
+    const UInt64 ticks = me->fTracePostedTicks;
+    IOSimpleLockUnlockEnableInterrupt(lock, state);
+    uint64_t ns = 0;
+    if (ticks) absolutetime_to_nanoseconds(ticks, &ns);
+    args->scalarOutput[0] = seq;
+    args->scalarOutput[1] = ns;
+    return kIOReturnSuccess;
 }
 IOReturn NVRMUserClient::sWaitEvent(OSObject *target, void *reference, IOExternalMethodArguments *args)
 {

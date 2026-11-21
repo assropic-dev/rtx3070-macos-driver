@@ -72,11 +72,15 @@ for fn in ('image_write_region', 'image_read_region'):
 # plane is a full uint32 from the caller and reached deviceCacheForIOSurface before any clamp.
 # Anchor on the mangled call, not the readable name: the comment above the clamp names the function too,
 # and an earlier version of this arm matched that comment and passed while measuring nothing.
-sv = accel.split('static IOReturn nvAccelSurfVram')[1][:2600]
+sv = accel.split('static IOReturn nvAccelSurfVram')[1].split('\n}\n', 1)[0]
 call = '_ZN22IOGraphicsAccelerator223deviceCacheForIOSurface'
 check('the surface escape bounds the caller plane before the cache lookup',
       'if (p->plane > 15)' in sv and call in sv
-      and sv.index('if (p->plane > 15)') < sv.index(call))
+      and sv.index('if (p->plane > 15)') < min(sv.index(call), sv.index('plane.resolve(')))
+video_plane = accel.split('struct NVVideoPlane {', 1)[1].split('\n};', 1)[0]
+check('a video allocation lookup only accepts the two verified planes',
+      'if (index >= 2) return false;' in video_plane and call in video_plane
+      and video_plane.index('if (index >= 2)') < video_plane.index(call))
 
 # off + len wraps for a near-2^64 access size, and IOSubMemoryDescriptor's own test wraps identically.
 check('the sysmem mapping clamp subtracts instead of adding',

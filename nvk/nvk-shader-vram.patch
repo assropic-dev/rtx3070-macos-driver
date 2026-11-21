@@ -1,0 +1,24 @@
+--- a/src/nouveau/vulkan/nvk_device.c
++++ b/src/nouveau/vulkan/nvk_device.c
+@@ -324,15 +324,17 @@
+             goto fail_samplers;
+       }
+ 
+-      /* If we have a full BAR, go ahead and do shader uploads on the CPU.
+-       * Otherwise, we fall back to doing shader uploads via the upload queue.
++      /* A CPU map puts this heap in system memory on the macOS NVRM
++       * backend. Use the upload queue to keep the code BOs local there.
+        *
+-       * Also, the I-cache pre-fetches and NVIDIA has informed us
+-       * overallocating shaders BOs by 2K is sufficient.
++       * The I-cache pre-fetches and NVIDIA has informed us that
++       * overallocating shader BOs by 2K is sufficient.
+        */
+       enum nvkmd_mem_map_flags shader_map_flags = 0;
++#ifndef __APPLE__
+       if (pdev->info.bar_size_B >= pdev->info.vram_size_B)
+          shader_map_flags = NVKMD_MEM_MAP_WR;
++#endif
+       result = nvk_heap_init(dev, &dev->shader_heap,
+                              NVKMD_MEM_LOCAL, shader_map_flags,
+                              2048 /* overalloc */,

@@ -13,6 +13,17 @@
 /* NVRM_ESC_SURF_DIRTY with this plane bit gives up with NVRM_SS_BUSY instead of waiting for the accelerator lock
  * (accelerators that publish NVAccelSurfaceWait) */
 #define NVRM_SS_PLANE_TRYLOCK  0x40000000u
+/* GPU-decoded bi-planar frame. VRAM: low bit selects the plane, READ requires a published
+ * frame, pad returns its backing cookie. DIRTY: size packs the two 32-bit cookies (Y low).
+ * The old driver rejects these values as unsupported plane indices. */
+#define NVRM_SS_PLANE_VIDEO_FRAME 0x20000000u
+#define NVRM_SS_VIDEO_READ 2u
+/* Single-plane compositor surfaces. DIRTY with COOKIE looks up the calling task's
+ * plane-0 backing and returns its cookie as status (SID 0 probes the selector).
+ * VRAM with COOKIE | cookie exports only that allocation. The 28-bit cookie must
+ * fit in full; larger allocation serials use the unguarded, uncached path. */
+#define NVRM_SS_PLANE_COOKIE 0x10000000u
+#define NVRM_SS_COOKIE_MAX   0x0fffffffu
 #define NVRM_SS_BAD_VERSION   0x80000001u
 #define NVRM_SS_OFF           0x80000002u
 #define NVRM_SS_NO_SURFACE    0x80000003u

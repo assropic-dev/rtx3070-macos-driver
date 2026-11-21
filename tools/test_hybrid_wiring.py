@@ -25,7 +25,8 @@ arm("import is tried only at level 2 and only on a framebuffer that is not NVIDI
 arm("a copied frame after an imported one takes the plane home first", "nvAccelHybridHome(fb, head);" in accel and "nmh_shadow_invalidate(&gHyShadow[head].sh)" in accel)
 arm("the surface is flushed from the CPU's caches before the other GPU reads it", "kIOMemoryIncoherentIOFlush" in accel)
 arm("the surface's pixels are final before it is flipped to (same checks as the copy path)",
-    accel.count("if (!p2p && !nvAccelSurfCopyReady(s, head)) return true;") == 1 and "nvSurfWaitReady(id);\n    const unsigned long long len" in accel)
+    accel.count("if (!p2p && !nvAccelSurfCopyReady(s, head)) return true;") == 1 and
+    "if (!nvSurfWaitReady(id)) return true;" in accel)
 arm("the panel driver takes the panel only with the switch on", re.search(r"nmh_level_parse\(present, lv\);\s*if \(!fHyLevel\) return nullptr;", ifb) is not None)
 arm("the panel driver writes translation-table entries only in a run of equal unused entries", "nmh_find_free_run(ggttRead" in ifb)
 arm("the panel driver never edits entries of the firmware surface", "fwLo, fwHi" in ifb)

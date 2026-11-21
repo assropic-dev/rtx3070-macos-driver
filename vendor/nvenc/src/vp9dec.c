@@ -46,15 +46,14 @@ int vp9dec_open(Vp9Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
         memset(b[i].m->cpu, 0, b[i].m->size);
     }
     const size_t luma = nvenc_in_plane_size(d->pitch, d->maxH) + 65536, chroma = nvenc_in_plane_size(d->pitch, d->maxH / 2) + 65536;
-    for (int i = 0; i < VP9_SURFACES; i++)
-        if (rm_mem_alloc(rm, &d->luma[i], (luma + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true) ||
-            rm_mem_alloc(rm, &d->chroma[i], (chroma + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true)) { fprintf(stderr, "vp9dec: surface alloc failed\n"); return -1; }
+    if (!dec_picture_surfaces(&d->copy, rm, d->pitch, d->maxH, d->luma, luma, d->chroma, chroma, VP9_SURFACES, false)) return -1;
     chan_mthd(&d->chan, 0, NVC56F_SET_OBJECT, 1, rm_class(rm, RM_CLS_NVDEC));
     return 0;
 }
 
 void vp9dec_close(Vp9Dec *d)
 {
+    dec_copy_close(&d->copy);
     chan_destroy(&d->chan);
     RmMem *m[] = { &d->setup, &d->bs, &d->probs, &d->counts, &d->seg[0], &d->seg[1], &d->tiles, &d->colmv[0], &d->colmv[1],
                    &d->filter, &d->intra, &d->status, &d->sem };
@@ -298,15 +297,14 @@ int vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n)
         chan_mthd(c, 0, NVC9B0_SET_PICTURE_CHROMA_OFFSET0 + 4 * (NvU32)i, 1, hi(d->chroma[sfc[i]].gpu));
     }
     chan_mthd(c, 0, NVC9B0_EXECUTE, 1, 0u);
-    const NvU32 val = ++d->semval; volatile NvU32 *sv = d->sem.cpu;
+    const NvU32 val = ++d->semval;
     chan_mthd(c, 0, NVC9B0_SEMAPHORE_A, 3, (NvU32)(d->sem.gpu >> 32), (NvU32)d->sem.gpu, val);
     chan_mthd(c, 0, NVC9B0_SEMAPHORE_D, 1, DRF_DEF(C9B0, _SEMAPHORE_D, _STRUCTURE_SIZE, _ONE) |
               DRF_DEF(C9B0, _SEMAPHORE_D, _OPERATION, _RELEASE) | DRF_DEF(C9B0, _SEMAPHORE_D, _PAYLOAD_SIZE, _32BIT));
     const double t0 = now_ms();
-    chan_submit(c);
-    while (sv[0] != val && now_ms() - t0 < 1000) { }
+    const bool completed = !chan_submit(c) && chan_wait_release(c, &d->sem, val);
     d->engine_ms = now_ms() - t0;
-    if (sv[0] != val) { fprintf(stderr, "vp9dec: no completion (error notifier 0x%x)\n", chan_error(c)); return -1; }
+    if (!completed) { fprintf(stderr, "vp9dec: no completion (error notifier 0x%x)\n", chan_error(c)); return -1; }
     const nvdec_status_s *st = d->status.cpu;
     d->err_status = st->error_status; d->ok_blocks = st->mbs_correctly_decoded;
     if (d->verbose)

@@ -56,9 +56,9 @@ int av1dec_open(Av1Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
     for (int i = 0; i < 8; i++) if (alloc(rm, &d->cdf[i], d->cdf_size + 4096)) return -1;
     if (alloc(rm, &d->zseg, AV1_SEGMENT_ID_BUF_SIZE(W, H))) return -1;
     const size_t luma = nvenc_in_plane_size(d->pitch, d->maxH) + 65536, chroma = nvenc_in_plane_size(d->pitch, d->maxH / 2) + 65536;
+    if (!dec_picture_surfaces(&d->copy, rm, d->pitch, d->maxH, d->luma, luma, d->chroma, chroma, AV1_SURFACES, true)) return -1;
     for (int i = 0; i < AV1_SURFACES; i++)
-        if (alloc(rm, &d->luma[i], luma) || alloc(rm, &d->chroma[i], chroma) ||
-            alloc(rm, &d->tmv[i], AV1_TEMPORAL_MV_BUF_SIZE(W, H)) || alloc(rm, &d->seg[i], AV1_SEGMENT_ID_BUF_SIZE(W, H))) {
+        if (alloc(rm, &d->tmv[i], AV1_TEMPORAL_MV_BUF_SIZE(W, H)) || alloc(rm, &d->seg[i], AV1_SEGMENT_ID_BUF_SIZE(W, H))) {
             fprintf(stderr, "av1dec: surface alloc failed\n"); return -1;
         }
     chan_mthd(&d->chan, 0, NVC56F_SET_OBJECT, 1, rm_class(rm, RM_CLS_NVDEC));
@@ -67,6 +67,7 @@ int av1dec_open(Av1Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
 
 void av1dec_close(Av1Dec *d)
 {
+    dec_copy_close(&d->copy);
     chan_destroy(&d->chan);
     RmMem *m[] = { &d->setup, &d->bs, &d->cdf_def, &d->cdf_out, &d->tileinfo, &d->tilestream, &d->filter, &d->intra, &d->gm, &d->fg, &d->status, &d->sem };
     for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) rm_mem_free(d->rm, m[i]);
@@ -541,15 +542,14 @@ static int decode_frame(Av1Dec *d)
     }
     #undef BUF
     chan_mthd(c, 0, NVC9B0_EXECUTE, 1, 0u);
-    const NvU32 val = ++d->semval; volatile NvU32 *sv = d->sem.cpu;
+    const NvU32 val = ++d->semval;
     chan_mthd(c, 0, NVC9B0_SEMAPHORE_A, 3, (NvU32)(d->sem.gpu >> 32), (NvU32)d->sem.gpu, val);
     chan_mthd(c, 0, NVC9B0_SEMAPHORE_D, 1, DRF_DEF(C9B0, _SEMAPHORE_D, _STRUCTURE_SIZE, _ONE) |
               DRF_DEF(C9B0, _SEMAPHORE_D, _OPERATION, _RELEASE) | DRF_DEF(C9B0, _SEMAPHORE_D, _PAYLOAD_SIZE, _32BIT));
     const double t0 = now_ms();
-    chan_submit(c);
-    while (sv[0] != val && now_ms() - t0 < 1000) { }
+    const bool completed = !chan_submit(c) && chan_wait_release(c, &d->sem, val);
     d->engine_ms = now_ms() - t0;
-    if (sv[0] != val) { fprintf(stderr, "av1dec: no completion (error notifier 0x%x)\n", chan_error(c)); return -1; }
+    if (!completed) { fprintf(stderr, "av1dec: no completion (error notifier 0x%x)\n", chan_error(c)); return -1; }
     const nvdec_status_s *st = d->status.cpu;
     d->err_status = st->error_status; d->ok_blocks = st->mbs_correctly_decoded;
     if (d->verbose)
