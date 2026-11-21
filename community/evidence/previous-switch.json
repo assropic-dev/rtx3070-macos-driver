@@ -1,0 +1,30 @@
+{
+  "observed_frontmost_pid_confirmation_ms": {
+    "n": 20,
+    "p50": 6.4270914999999995,
+    "p95": 57.550453,
+    "p99": 144.02981,
+    "max": 144.02981
+  },
+  "global_first_flip_after_requested_ms": {
+    "n": 20,
+    "p50": 10.9738495,
+    "p95": 32.049546,
+    "p99": 145.150406,
+    "max": 145.150406
+  },
+  "global_interval_including_inter_switch_static_desktop_ms": {
+    "n": 212,
+    "p50": 14.990461,
+    "p95": 28.0035695,
+    "p99": 32.998315,
+    "max": 185.9973475
+  },
+  "error_delta": {
+    "nvaccel_iop_async_drop": 0,
+    "nvaccel_iop_async_refused": 0,
+    "nvaccel_iop_late": 0,
+    "nvrmfb_flip_latch_timeouts": 0,
+    "nvaccel_surface_gpu_timeouts": 0
+  }
+}

@@ -1,0 +1,5 @@
+87e524ab36f12d17c04626d6cf7fc3bde1cc63e4
+ok   the listing is not empty (the check looked at something)
+ok   every tracked top-level entry is one the project is made of
+ok   control: a stray top-level folder is reported
+PASS

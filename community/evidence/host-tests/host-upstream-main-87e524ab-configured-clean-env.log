@@ -1,0 +1,63 @@
+FAIL test_fw_fetch.py: exit 1
+Traceback (most recent call last):
+  File "<host-test-workspace>/upstream-main/tools/test_fw_fetch.py", line 14, in <module>
+    from compression import zstd
+ModuleNotFoundError: No module named 'compression'
+
+
+FAIL test_hybrid_fb_dependent_id.py: exit 1
+ok   three start paths were found (NMIntelFB virtual, NMIntelFB panel, NMGopFB)
+ok   NMIntelFB start path 0: the dependent ID and index are set before IOFramebuffer::start
+ok   NMIntelFB start path 1: the dependent ID and index are set before IOFramebuffer::start
+ok   NMGopFB start path 0: the dependent ID and index are set before IOFramebuffer::start
+ok   NMIntelFB: a surface that will not map stops start before IOFramebuffer::start (no controller-less framebuffer)
+ok   NMIntelFB: the surface-map failure return comes before resumeCapture, tcStart, the DMC target and the backlight
+ok   NMIntelFB: a failed IOFramebuffer::start (after state is published) runs the shared unwind
+ok   NMIntelFB: the unwind clears the DMC target under its lock, frees the blob, the Type-C timer, external heads, resume capture, the backlight and both mappings
+ok   NMIntelFB: stop() uses the same unwind, so the two cannot drift apart
+FAIL negative control: the map-after-publish order of the first fix is caught
+ok   NVRMFB still sets its dependent ID before super::start (the reference order)
+ok   negative control: the check fails on the old order (pre-fix sources)
+1 failed
+
+
+FAIL test_no_category_shadowing.py: exit 1
+ok   no category re-implements a method of its class (0 found)
+UNKNOWN control: c6619e54 not in this checkout
+FAILED 1
+
+
+FAIL test_nvencvt_diag.py: exit 1
+ok   a flag file an ordinary user made is not honoured
+ok   a missing flag file is not honoured
+ok   control: a root-owned file nobody else can write is honoured
+ok   a link to a root-owned file is not a flag
+ok   an output name that is a planted link is refused and the target is untouched
+ok   an output file is created for its owner alone
+ok   append appends
+ok   a dump starts its file again
+ok   no flag file is tested with access() or opened with fopen() any more
+ok   no diagnostic output is opened with fopen()
+ok   all eight flag tests go through the rule
+FAIL control: the earlier library is readable (fatal: invalid object name '406d9824'.)
+FAILED
+
+
+FAIL test_pageoff_hold.py: exit 1
+ok   the unlocked wait is still in pageoff (the check looked at the right function)
+ok   the resource and the accelerator are held before the lock is released, until the function returns
+FAIL control: the earlier source is readable (fatal: invalid object name '406d9824'.)
+ok   the switch stays off by default and only root can turn it on
+FAILED
+
+
+not run test_claims.c: its header names no build line
+not run test_dlss_worker.c: its build line needs a path filled in (see its header)
+not run test_fcwarm.py: needs a built libnvmtl_translate.dylib and a shader file (build step)
+not run test_gl_translation.py: needs a built libnvmtl_translate.dylib (build step)
+not run test_nvrm_utilization.cpp: its header names no build line
+not run test_nvrmfb_audio_match.cpp: its header names no build line
+not run test_patch_chain.sh: needs a pristine NVIDIA open-gpu-kernel-modules 620.70.06 tree (build_nvrm.sh runs it)
+not run test_primary_gpu_range.cpp: its header names no build line
+not run test_resource_phi_fold.py: needs a built libnvmtl_translate.dylib (build step)
+241 passed, 5 failed, 0 skipped, 9 not run, of 255

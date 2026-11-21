@@ -1,0 +1,7 @@
+OK   610-backlight-register-log.patch
+OK   610-display-completion.patch
+OK   610-fsp-timer-double-destroy.patch
+OK   610-setmode-reason.patch
+OK   615-viewport-scaling.patch
+OK   620-color-range.patch
+OK   620-yuv420-hw.patch

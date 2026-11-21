@@ -1,0 +1,95 @@
+{
+  "framebuffer": "126    0 0xffffff7f976ef000 0x37b22    0x37b22    com.nullmoth.NVRMFB (3.0) 860AC4A5-4FAD-3C09-80E4-59F9F287CFA7 <114 19 7 6 3 1>",
+  "mode": {
+    "render_height": 2880,
+    "ui_height": 1440,
+    "hz": 160.00001525878906,
+    "ui_width": 2560,
+    "mode_id": 2147504208,
+    "render_width": 5120
+  },
+  "warmup": [
+    {
+      "size": "5120x2880x4",
+      "texture_ms": [
+        9.38127
+      ],
+      "counter_delta": {
+        "vram_prepare_hits": 1,
+        "vram_prepare_misses": 0,
+        "vram_prepare_cleared": 0,
+        "vram_prepare_budget": 0
+      }
+    },
+    {
+      "size": "4170x2426x8",
+      "texture_ms": [
+        225.180009
+      ],
+      "counter_delta": {
+        "vram_prepare_hits": 0,
+        "vram_prepare_misses": 1,
+        "vram_prepare_cleared": 1,
+        "vram_prepare_budget": 0
+      }
+    }
+  ],
+  "alternating_bursts": [
+    {
+      "size": "5120x2880x4",
+      "texture_ms": [
+        6.389468,
+        5.997913,
+        6.592519
+      ],
+      "counter_delta": {
+        "vram_prepare_hits": 3,
+        "vram_prepare_misses": 0,
+        "vram_prepare_cleared": 0,
+        "vram_prepare_budget": 0
+      }
+    },
+    {
+      "size": "4170x2426x8",
+      "texture_ms": [
+        11.492081,
+        8.732804,
+        16.10743
+      ],
+      "counter_delta": {
+        "vram_prepare_hits": 3,
+        "vram_prepare_misses": 0,
+        "vram_prepare_cleared": 0,
+        "vram_prepare_budget": 0
+      }
+    },
+    {
+      "size": "5120x2880x4",
+      "texture_ms": [
+        6.638955,
+        9.382153,
+        6.803815
+      ],
+      "counter_delta": {
+        "vram_prepare_hits": 3,
+        "vram_prepare_misses": 0,
+        "vram_prepare_cleared": 0,
+        "vram_prepare_budget": 0
+      }
+    },
+    {
+      "size": "4170x2426x8",
+      "texture_ms": [
+        9.198338,
+        8.856968,
+        8.583344
+      ],
+      "counter_delta": {
+        "vram_prepare_hits": 3,
+        "vram_prepare_misses": 0,
+        "vram_prepare_cleared": 0,
+        "vram_prepare_budget": 0
+      }
+    }
+  ]
+}

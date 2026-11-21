@@ -1,0 +1,15 @@
+{
+  "original_upstream": "https://github.com/nullmoth/nvidia-macos-driver",
+  "release_base": "5289b35091e199644a9a2e414ee6d463c6c4c401",
+  "upstream_main_checked": "87e524ab36f12d17c04626d6cf7fc3bde1cc63e4",
+  "local_committed_head": "5175844223ad342c19c5d11c712988bff8aba08c",
+  "complete_local_tree": "115c6fba2f4275feebf34f9b07c88bd31666294e",
+  "local_patch_applied_to_online_main_tree": "f8deff00ef5790ca80bef609b30b37dfa669c865",
+  "local_commits_since_v3.0": [
+    "44e9a4c0602a8cd6157080778af565635fc10d9b Keep GA104 decoded frames in VRAM and synchronize desktop presentation",
+    "5236da542ebb4f887615877d0f993ee994a7bcb2 Avoid synchronous fragment uploads for small WindowServer surfaces",
+    "b09db2bdea7a4a1f31d1c876e94931a8558b5136 Reuse IOSurface backing imports across compositor texture wrappers",
+    "5175844223ad342c19c5d11c712988bff8aba08c Isolate WindowServer GPU completion notifications from capture-related lock contention"
+  ],
+  "archive_scope": "Complete local Git source tree (committed, modified, and nonignored new files), companion viewer source, packaging recipes and test evidence. The installer reuses pinned prebuilt inputs; not every experimental source patch is in the installed binaries."
+}

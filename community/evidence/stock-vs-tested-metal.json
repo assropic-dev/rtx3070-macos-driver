@@ -1,0 +1,26 @@
+{
+  "protocol": "single process with exact plugin image, 512x512 BGRA8 IOSurface, two Metal queues and shared event, checked pixel on every iteration; same local kernel and Vulkan ICD in both arms",
+  "upstream_tar_sha256": "40f0390d0b7cda75637991879b09abb7f8f7e3e5db2e811196963b3a2cacbcad",
+  "runs": [
+    {
+      "arm": "upstream",
+      "verified": 240,
+      "p50_ms": 0.4241555
+    },
+    {
+      "arm": "installed",
+      "verified": 240,
+      "p50_ms": 0.3568445
+    },
+    {
+      "arm": "installed",
+      "verified": 240,
+      "p50_ms": 0.143965
+    },
+    {
+      "arm": "upstream",
+      "verified": 240,
+      "p50_ms": 0.1421315
+    }
+  ]
+}

@@ -1,0 +1,96 @@
+{
+  "polls": 8180,
+  "rejected_poll_reads": 0,
+  "same_count_different_sums": 0,
+  "poll_spacing_ms": {
+    "p50": 0.9998,
+    "p95": 1.0516,
+    "p99": 1.0579,
+    "max": 12.2257
+  },
+  "counter_read_cost_us": {
+    "p50": 10.31,
+    "p95": 17.793,
+    "p99": 21.36,
+    "max": 3760.525
+  },
+  "phase_selected_pure_flip_count": 772,
+  "phase_single_reconstructed": 772,
+  "phase_batch_calls": 0,
+  "phase_ambiguous_calls": 0,
+  "single_return_bracket_ms": {
+    "p50": 1.0105,
+    "p95": 1.0556,
+    "p99": 1.0719,
+    "max": 6.0256
+  },
+  "single_kernel_us": {
+    "p50": 57,
+    "p95": 2096,
+    "p99": 2116,
+    "max": 2203
+  },
+  "single_return_gap_mid_ms": {
+    "p50": 9.9872,
+    "p95": 16.0033,
+    "p99": 18.9846,
+    "max": 71.0227
+  },
+  "single_pre_call_mid_ms": {
+    "p50": 8.97,
+    "p95": 15.9362,
+    "p99": 17.9589,
+    "max": 70.9657
+  },
+  "definite_long_return_gap_20_83ms": 6,
+  "long_gap_kernel_us": {
+    "p50": 62,
+    "p95": 1073,
+    "p99": 1073,
+    "max": 1073
+  },
+  "long_gap_kernel_under_half_of_lower_bound": 6,
+  "slow_counter_delta": {
+    "nvaccel_iop_ok": 771,
+    "nvaccel_iop_flips": 771,
+    "nvaccel_iop_late": 0,
+    "nvaccel_iop_async_drop": 0,
+    "nvaccel_iop_async_refused": 0,
+    "nvaccel_iop_flip_refused": 0,
+    "nvrmfb_flip_latch_timeouts": 0,
+    "nvrmfb_flip_latch_late": 0,
+    "nvrmfb_flip_latch_waits": 0,
+    "nvaccel_surface_gpu_marks": 5306,
+    "nvaccel_surface_gpu_waits": 771,
+    "nvaccel_surface_gpu_timeouts": 0,
+    "nvaccel_iop_flip_hit": 771,
+    "nvaccel_iop_flip_miss": 0,
+    "nvrm_pageoff_coalesced": 0,
+    "nvrm_pageoff_perpage": 0,
+    "nvaccel_vm_alloc": 3,
+    "nvaccel_res_new": 3,
+    "nvaccel_res_free": 6,
+    "nvrm_pm_waited": 0
+  },
+  "slow_counter_coverage_mach": [
+    4476828940084,
+    4484824021345
+  ],
+  "input_events": 959,
+  "input_source": "CGHID down/drag/up on own titlebar, independently observed bounds",
+  "clock": {
+    "timebase_numer": 1,
+    "timebase_denom": 1,
+    "mach_host": 4476708919168,
+    "unix": 1795242630.337754,
+    "anchor_span_ticks": 231,
+    "end_mach": 4484922492925,
+    "end_unix": 1795242638.551259,
+    "end_span_ticks": 1062,
+    "nominal_poll_ms": 1,
+    "missed_poll_slots": 35,
+    "polls": 8180,
+    "cpu_user_s": 0.040554,
+    "cpu_sys_s": 0.130872
+  }
+}

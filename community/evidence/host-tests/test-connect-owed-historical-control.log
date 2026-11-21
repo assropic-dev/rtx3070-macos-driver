@@ -1,0 +1,3 @@
+All five present-day owed-interrupt wiring checks passed.
+Historical negative control rejected the pre-fix source at 91aa568aca67d3ee36c7a477a1ccd38571b013d4
+The official runner selects HEAD for any dirty nvrm-fb.cpp. HEAD already contains the fix 70580d1c4505ef275c3ca64e0e505fd2563cc754

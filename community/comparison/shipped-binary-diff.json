@@ -1,0 +1,142 @@
+[
+  {
+    "component": "NVAccel-15",
+    "path": "Library/NullMoth/kexts/15/NVAccel.kext/Contents/MacOS/NVAccel",
+    "upstream_v3_sha256": "d4ced924df69dea1fd73e0e0a485b6d711e77d829b809189458274c0e70efb7d",
+    "local_sha256": "55e770eb8d97977d1b749a668b5ba2d6d5b9b24d3c86538d9b0feb20960b5b52",
+    "identical": false
+  },
+  {
+    "component": "NVAccel-26",
+    "path": "Library/NullMoth/kexts/26/NVAccel.kext/Contents/MacOS/NVAccel",
+    "upstream_v3_sha256": "4b5020c65640357326d0a17aed316b1d13562c578a8d2ca83e0e9070821a8d56",
+    "local_sha256": "d20b33fe71e3a3592dd1d7e70aee15b066b84e05ae32a95d8863ade5b2ce7797",
+    "identical": false
+  },
+  {
+    "component": "NVRMFB",
+    "path": "Library/Extensions/NVRMFB.kext/Contents/MacOS/NVRMFB",
+    "upstream_v3_sha256": "4d3c4c026629f8d3483411fd4209ffaff787edf6f45845ec75f4e0b76933a85d",
+    "local_sha256": "6da394f155441cf1019c7d02d3b2ec51f9e591dc821bac7d79878ef03334a917",
+    "identical": false
+  },
+  {
+    "component": "NVMTLDriver",
+    "path": "Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver",
+    "upstream_v3_sha256": "7d2e06e65a5109acd9ab56a7435ac1f3845e68b5a1a232bb1969b5d0a880c113",
+    "local_sha256": "1b93db73660bb6975f7d9149e77998b4adf8ed77c08d4f5c4f03c4c22a98db80",
+    "identical": false
+  },
+  {
+    "component": "NVK",
+    "path": "Library/GPUBundles/nvmtl/libvulkan_nouveau.dylib",
+    "upstream_v3_sha256": "e614521bd06d1c17a1996db977e7faec6749c0fc7da7dc55f0d79dafbad10e52",
+    "local_sha256": "4e56026f67822a3b75959f061ee209d0f72d5f968eb2c935bf8fa5f96b887e30",
+    "identical": false
+  },
+  {
+    "component": "NVRM",
+    "path": "Library/Extensions/NVRM.kext/Contents/MacOS/NVRM",
+    "upstream_v3_sha256": "ba6184e9a092687692af1b9e16cff555c7c3f1d81c258c8c8b77273ed7cadf05",
+    "local_sha256": "ba6184e9a092687692af1b9e16cff555c7c3f1d81c258c8c8b77273ed7cadf05",
+    "identical": true
+  },
+  {
+    "component": "NVRMAGDC",
+    "path": "Library/Extensions/NVRMAGDC.kext/Contents/MacOS/NVRMAGDC",
+    "upstream_v3_sha256": "97623c55c4a804fd5d4a5338d06672fe87f160576435853dc6b6e13505b325b9",
+    "local_sha256": "97623c55c4a804fd5d4a5338d06672fe87f160576435853dc6b6e13505b325b9",
+    "identical": true
+  },
+  {
+    "component": "libnvdec_h264.dylib",
+    "path": "Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvdec_h264.dylib",
+    "upstream_v3_sha256": "6068bacc3ef379c87985d28e4e177bd5b0b28f09c4263c4e786bc4bd3d3f16d0",
+    "local_sha256": "6068bacc3ef379c87985d28e4e177bd5b0b28f09c4263c4e786bc4bd3d3f16d0",
+    "identical": true
+  },
+  {
+    "component": "libnvdec_h264_t2d.dylib",
+    "path": "Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvdec_h264_t2d.dylib",
+    "upstream_v3_sha256": "fdfd6e9c356bb4eac42d6841d950db3545cb97e6bcb2b039132d190119a52de3",
+    "local_sha256": "fdfd6e9c356bb4eac42d6841d950db3545cb97e6bcb2b039132d190119a52de3",
+    "identical": true
+  },
+  {
+    "component": "libnvdec_hevc.dylib",
+    "path": "Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvdec_hevc.dylib",
+    "upstream_v3_sha256": "64b2353a900dc8bb6feb6c4b0037b948bdcb5d568d4573693cc56f3b7ba1e537",
+    "local_sha256": "64b2353a900dc8bb6feb6c4b0037b948bdcb5d568d4573693cc56f3b7ba1e537",
+    "identical": true
+  },
+  {
+    "component": "libnvenc_h264.dylib",
+    "path": "Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvenc_h264.dylib",
+    "upstream_v3_sha256": "fb0cd5308c52072fedfdee0b83350294e8081d8628a6af99cb1230999ba73640",
+    "local_sha256": "fb0cd5308c52072fedfdee0b83350294e8081d8628a6af99cb1230999ba73640",
+    "identical": true
+  },
+  {
+    "component": "libnvenc_h264_ga10x.dylib",
+    "path": "Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvenc_h264_ga10x.dylib",
+    "upstream_v3_sha256": "92985c5286ddc5c5dfb77ec04ea3364d92524e461abf93fb3646c4fe302488cb",
+    "local_sha256": "92985c5286ddc5c5dfb77ec04ea3364d92524e461abf93fb3646c4fe302488cb",
+    "identical": true
+  },
+  {
+    "component": "libnvenc_h264_tu10x.dylib",
+    "path": "Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvenc_h264_tu10x.dylib",
+    "upstream_v3_sha256": "5c8beff535e41c50f156272055e5da5a47340796890318b93419c0afb4d25d03",
+    "local_sha256": "5c8beff535e41c50f156272055e5da5a47340796890318b93419c0afb4d25d03",
+    "identical": true
+  },
+  {
+    "component": "libnvenc_hevc.dylib",
+    "path": "Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvenc_hevc.dylib",
+    "upstream_v3_sha256": "3d8da379030c0e9927b596b30afa4e0ab911a9070469e4b1a5574679ee1f959a",
+    "local_sha256": "3d8da379030c0e9927b596b30afa4e0ab911a9070469e4b1a5574679ee1f959a",
+    "identical": true
+  },
+  {
+    "component": "libnvenc_hevc_ga10x.dylib",
+    "path": "Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvenc_hevc_ga10x.dylib",
+    "upstream_v3_sha256": "7dc75f56ecb28678e8b64dcfe3766b2966ac44abd6add07ff9c40c60fd59bbf6",
+    "local_sha256": "7dc75f56ecb28678e8b64dcfe3766b2966ac44abd6add07ff9c40c60fd59bbf6",
+    "identical": true
+  },
+  {
+    "component": "libnvenc_hevc_tu10x.dylib",
+    "path": "Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvenc_hevc_tu10x.dylib",
+    "upstream_v3_sha256": "d6f1587eda2bd653857f05379a38ae053fd6fdd40f741e5c7ee31b63243b2f27",
+    "local_sha256": "d6f1587eda2bd653857f05379a38ae053fd6fdd40f741e5c7ee31b63243b2f27",
+    "identical": true
+  },
+  {
+    "component": "libnvencvt.dylib",
+    "path": "Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvencvt.dylib",
+    "upstream_v3_sha256": "80d70d613522c47dae2d7a14ac400cf44328ae1c9147e14adda7215c79b032d2",
+    "local_sha256": "05ccacb225e9e7e454a315f7b03dd0dd8c842d4735c81d19735f5610e21e5b8c",
+    "identical": false
+  },
+  {
+    "component": "libnvmtl_translate.dylib",
+    "path": "Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvmtl_translate.dylib",
+    "upstream_v3_sha256": "2fd53e2a3571010b40c6d3fa305a3f1c41705b0afeb17a403677b1e69cf22ee0",
+    "local_sha256": "2fd53e2a3571010b40c6d3fa305a3f1c41705b0afeb17a403677b1e69cf22ee0",
+    "identical": true
+  },
+  {
+    "component": "libvulkan.1.4.362.dylib",
+    "path": "Library/GPUBundles/nvmtl/libvulkan.1.4.362.dylib",
+    "upstream_v3_sha256": "dc81d04917bd1aad88b2ec150ff3150f44dd24b786b227874492aae62e7c9c6e",
+    "local_sha256": "dc81d04917bd1aad88b2ec150ff3150f44dd24b786b227874492aae62e7c9c6e",
+    "identical": true
+  },
+  {
+    "component": "nvmtl-boost",
+    "path": "Library/NullMoth/boost/nvmtl-boost",
+    "upstream_v3_sha256": "7dd80566a00f945d4b3224564865956a04e26f254fd806eac8fec42853718c07",
+    "local_sha256": "7dd80566a00f945d4b3224564865956a04e26f254fd806eac8fec42853718c07",
+    "identical": true
+  }
+]

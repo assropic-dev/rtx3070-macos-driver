@@ -1,0 +1,6 @@
+test_nvrm_utilization
+PERFMON parser: 18 checks passed
+test_nvrmfb_audio_match
+PASS: synthetic ELD/EDID, pin order, dual displays, ambiguity, malformed ELD/config, MST/fallback, stale/unavailable snapshots
+test_primary_gpu_range
+PASS unique console range from four-card report, exact boundaries and overflow-safe refusal

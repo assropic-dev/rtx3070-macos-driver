@@ -1,0 +1,22 @@
+ok    without the opt-in, a release plugin forgets every inherited NVMTL_/NVK_/NAK_/NVRM_ knob
+ok    it reports how many it forgot (5)
+ok    the three per-process switches survive as they always did
+ok    a variable that only starts like ours, and an unrelated one, are untouched
+ok    NVMTL_PROCESS_ENV=1 keeps every knob for this process
+ok    and forgets nothing (0)
+ok    NVMTL_PROCESS_ENV=0 is not an opt-in: the knobs are forgotten, the gate itself among them
+ok    that run forgot 6
+ok    only the exact value 1 opts in: NVMTL_PROCESS_ENV=yes is forgotten with the rest
+ok    the cached per-process answer agrees with the vector rule (opted in)
+ok    the vector rule sees the opt-in go; the cached answer is decided once per process (a process cannot opt in late)
+ok    a setuid/setgid process keeps no knob even with NVMTL_PROCESS_ENV=1 (no library path, no switch)
+ok    a root process keeps no knob even with NVMTL_PROCESS_ENV=1
+ok    negative control: an ordinary process that opts in still keeps its own knobs
+ok    METAL2VULKAN_/MESA_/NIR_/RADV_/ACO_ variables are forgotten like ours
+ok    a name that only starts like one (MESAX_) is untouched
+ok    ELFHOST_PATH and ELFHOST_TRACE, the DLSS host's library search path and trace, are forgotten like our knobs
+ok    negative control: a process that opted in keeps ELFHOST_PATH
+ok    a root-owned library path in a root-only folder is allowed
+ok    negative control: a user-owned file is refused
+ok    a relative path, a missing file and a null are refused
+PASS: 0 failed

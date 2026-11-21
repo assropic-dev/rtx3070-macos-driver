@@ -1,0 +1,20 @@
+ok   a good download installs ngx, snippets, kernels and a manifest
+ok   installed kernels are 0644 and nothing is group or other writable
+ok   no staging folder or temp file is left behind
+ok   a second run with nothing changed does nothing
+ok   another card's SM rebuilds and keeps the earlier SM's kernels
+ok   NEGATIVE: a download with the wrong SHA-256 is refused and nothing is installed
+ok   NEGATIVE: a wrong file inside the NVIDIA package is refused
+ok   NEGATIVE: a wrong nvJitLink inside the wheel is refused
+ok   NEGATIVE: a failing kernel build leaves the earlier install untouched
+ok   NEGATIVE: without --yes and without a terminal nothing is downloaded
+ok   card 2D05 builds for sm_120
+ok   card 2684 builds for sm_89
+ok   card 2503 builds for sm_86
+ok   card 1F08 builds for sm_75
+ok   card 21C4 builds for sm_75
+ok   card 2B85 builds for sm_120
+ok   NEGATIVE: an unclassified card is not guessed
+ok   install.sh offers the DLSS step
+ok   uninstall.sh removes /Library/NullMoth/dlss
+0 failed

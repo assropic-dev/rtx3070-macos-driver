@@ -1,0 +1,10 @@
+PASS  NVIDIA (NVK) claims exactly what it claimed before: barycentrics, Metal 3, ray tracing
+PASS  RDNA 2-4 claim barycentrics, Metal 3 and ray tracing
+PASS  GCN and Vega APUs claim Metal 3 (mesh is compute-emulated) but not barycentrics or ray tracing
+3 of 3 arms pass
+-- negative control (ungated claims):
+PASS  NVIDIA (NVK) claims exactly what it claimed before: barycentrics, Metal 3, ray tracing
+PASS  RDNA 2-4 claim barycentrics, Metal 3 and ray tracing
+FAIL  GCN and Vega APUs claim Metal 3 (mesh is compute-emulated) but not barycentrics or ray tracing
+2 of 3 arms pass
+claims: PASS (gated passes, ungated fails as it must)

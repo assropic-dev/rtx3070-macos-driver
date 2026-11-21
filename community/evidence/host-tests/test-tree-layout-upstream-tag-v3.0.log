@@ -1,0 +1,5 @@
+5289b35091e199644a9a2e414ee6d463c6c4c401
+ok   the listing is not empty (the check looked at something)
+FAIL every tracked top-level entry is one the project is made of: DEVELOPING.md
+FAIL control: a stray top-level folder is reported
+FAILED: every tracked top-level entry is one the project is made of, control: a stray top-level folder is reported

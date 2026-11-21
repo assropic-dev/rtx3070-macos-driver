@@ -1,0 +1,57 @@
+RTX 3070 Display 3.0.2 宿主测试记录
+2026-11-21（北京时间）
+
+测试范围
+在有完整本地提交历史的独立副本中运行仓库 tools/run_all_tests.py。
+两次对比使用相同的干净进程环境、Xcode 命令行工具及 Python 3.12.14。
+通过 CPATH、NVDEC_HEADERS、ZSTD 指向同一套本地 Vulkan Headers、Open GPU
+Documentation 视频头文件和 Zstandard 1.5.7 可执行文件。未修改原工作树、
+系统或者驱动安装状态。
+
+                                              通过  失败  跳过  未运行  总数
+上游 main 87e524ab36f12d17c04626d6cf7fc3bde1cc63e4  241     5     0       9   255
+本地源码快照，基于 5175844223ad342c19c5d11c712988bff8aba08c
+包含工作树的跟踪文件改动和未跟踪测试文件                  256     8     0      10   274
+
+完整日志为 host-upstream-main-87e524ab-configured-clean-env.log 和
+host-current-configured-clean-env.log。测试数量不同，单纯比较通过数不等同于通过率
+或同一测试集合的成败变化。
+
+两边共有的五项失败
+  test_fw_fetch.py  夹具生成需要 Python 3.14 的 compression.zstd，本机运行环境未配置该模块。
+  test_hybrid_fb_dependent_id.py  当前路径断言通过，历史的 map-after-publish 反例断言失败。
+  test_no_category_shadowing.py  当前扫描未发现问题，反例提交 c6619e54 未出现在本地 Git 对象中。
+  test_nvencvt_diag.py、test_pageoff_hold.py  当前行为或源码断言通过，反例提交 406d9824 不可用。
+
+本地源码多出的三项失败
+  test_tree_layout.py  本地脚本仍有 v3.0 tag 的规则问题。独立执行确认 v3.0 的 5289b350
+  失败，上游 main 的 87e524ab 通过。分别见 test-tree-layout-upstream-*.log。
+  test_nvrmfb_connect_owed.py  当前功能和接线断言通过，测试在 nvrm-fb.cpp 有未提交改动时
+  把已包含修复的 HEAD 当成反例。单独使用原测试函数和真正修复前的 91aa568a 后，
+  当前断言通过并成功拒绝旧版本。见 test-connect-owed-historical-control.log。
+  test_nvk_boost_burst.py  工作树的实验补丁修改了动态续租行为，旧测试的断言和编译夹具
+  对此失败。总包组装复用签名的 shader-vram NVK 二进制，SHA-256
+  4e56026f67822a3b75959f061ee209d0f72d5f968eb2c935bf8fa5f96b887e30
+  与实机现用文件相同，组装阶段未用该工作树的实验补丁重建 NVK。
+
+宿主跑器列为未运行的十项及补测
+  test_claims.c  由配套 test_claims.sh 编译执行，正常分支通过，禁用规则的反例按预期失败。
+  test_patch_chain.sh  使用从 620.70.06 tag 导出的干净 NVIDIA 源码，七个补丁均通过。
+  test_nvrm_utilization.cpp  独立编译，包括使用实际 NVIDIA 头文件的模式，18 个检查通过。
+  test_nvrmfb_audio_match.cpp、test_primary_gpu_range.cpp  独立编译执行通过。
+  test_dlss_worker.c  补齐 Vulkan 头文件后，本地和提交 51758442 的夹具仍因相同三个
+  未定义诊断符号链接失败。见 test-dlss-worker*.log。
+  test_fcwarm.py  需构建的 translator 以及对应固定 shader 文本和变体夹具，本次无结果。
+  test_gl_translation.py  需要 translator 和 SPIR-V 验证工具，本次无结果。
+  test_resource_phi_fold.py  需要 Cargo 已编译的 SPIR-V 依赖，本次无结果。
+  test_nvdec_vram_copy.c  本地独有的 GA104 实机复制测试，未在本轮宿主验证中运行。
+
+可用于对比的既有实机证据
+  在 5120×2880、160 Hz 的相同桌面回放中，先前 framebuffer 的 3 次大窗口运行
+  分别确认 2、2、3 次超过 100 ms 的上屏间隔。采用新 drawable pool 后分别为 0、1、0。
+  这 3 次运行的预备显存命中/未命中从 3/6 变为 9/0。小窗口控制组从 0、0、0 到
+  1、0、0，保留了非大尺寸突发操作的残余长间隔。
+  原始数据为 surface-stall-fix/postboot-e_w82u3p/desktop-replay/results.json 和
+  drawable-pool-3.0.2.dcWf9c/postboot-5FDD166F/desktop-replay/results.json。
+  这组数据验证的是 framebuffer 改动。宿主源码测试和组件回放分别提供局部证据，
+  整包安装、启动和长期桌面体验须由整包实机测试确认。

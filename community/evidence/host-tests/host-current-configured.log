@@ -1,0 +1,118 @@
+FAIL test_env_knobs.c: exit 1
+ocess
+ok    and forgets nothing (0)
+ok    NVMTL_PROCESS_ENV=0 is not an opt-in: the knobs are forgotten, the gate itself among them
+ok    that run forgot 6
+ok    only the exact value 1 opts in: NVMTL_PROCESS_ENV=yes is forgotten with the rest
+ok    the cached per-process answer agrees with the vector rule (opted in)
+ok    the vector rule sees the opt-in go; the cached answer is decided once per process (a process cannot opt in late)
+ok    a setuid/setgid process keeps no knob even with NVMTL_PROCESS_ENV=1 (no library path, no switch)
+ok    a root process keeps no knob even with NVMTL_PROCESS_ENV=1
+ok    negative control: an ordinary process that opts in still keeps its own knobs
+ok    METAL2VULKAN_/MESA_/NIR_/RADV_/ACO_ variables are forgotten like ours
+ok    a name that only starts like one (MESAX_) is untouched
+ok    ELFHOST_PATH and ELFHOST_TRACE, the DLSS host's library search path and trace, are forgotten like our knobs
+ok    negative control: a process that opted in keeps ELFHOST_PATH
+ok    a root-owned library path in a root-only folder is allowed
+ok    negative control: a user-owned file is refused
+ok    a relative path, a missing file and a null are refused
+FAIL: 1 failed
+
+
+FAIL test_fw_fetch.py: exit 1
+Traceback (most recent call last):
+  File "<host-test-workspace>/candidate/tools/test_fw_fetch.py", line 14, in <module>
+    from compression import zstd
+ModuleNotFoundError: No module named 'compression'
+
+
+FAIL test_hybrid_fb_dependent_id.py: exit 1
+ok   three start paths were found (NMIntelFB virtual, NMIntelFB panel, NMGopFB)
+ok   NMIntelFB start path 0: the dependent ID and index are set before IOFramebuffer::start
+ok   NMIntelFB start path 1: the dependent ID and index are set before IOFramebuffer::start
+ok   NMGopFB start path 0: the dependent ID and index are set before IOFramebuffer::start
+ok   NMIntelFB: a surface that will not map stops start before IOFramebuffer::start (no controller-less framebuffer)
+ok   NMIntelFB: the surface-map failure return comes before resumeCapture, tcStart, the DMC target and the backlight
+ok   NMIntelFB: a failed IOFramebuffer::start (after state is published) runs the shared unwind
+ok   NMIntelFB: the unwind clears the DMC target under its lock, frees the blob, the Type-C timer, external heads, resume capture, the backlight and both mappings
+ok   NMIntelFB: stop() uses the same unwind, so the two cannot drift apart
+FAIL negative control: the map-after-publish order of the first fix is caught
+ok   NVRMFB still sets its dependent ID before super::start (the reference order)
+ok   negative control: the check fails on the old order (pre-fix sources)
+1 failed
+
+
+FAIL test_no_category_shadowing.py: exit 1
+ok   no category re-implements a method of its class (0 found)
+UNKNOWN control: c6619e54 not in this checkout
+FAILED 1
+
+
+FAIL test_nvencvt_diag.py: exit 1
+ok   a flag file an ordinary user made is not honoured
+ok   a missing flag file is not honoured
+ok   control: a root-owned file nobody else can write is honoured
+ok   a link to a root-owned file is not a flag
+ok   an output name that is a planted link is refused and the target is untouched
+ok   an output file is created for its owner alone
+ok   append appends
+ok   a dump starts its file again
+ok   no flag file is tested with access() or opened with fopen() any more
+ok   no diagnostic output is opened with fopen()
+ok   all eight flag tests go through the rule
+FAIL control: the earlier library is readable (fatal: invalid object name '406d9824'.)
+FAILED
+
+
+FAIL test_nvk_boost_burst.py: exit 1
+ok   the patch defines nvkmd_nvrm_boost_burst
+ok   the infinite boost at device creation happens only in hold mode
+FAIL a lease never carries the compute-context flag
+ok   unset or 1 selects the per-burst lease, 0 selects off, hold selects the held boost
+ok   every command submission renews the lease
+FAIL teardown clears any boost that is still leased or held
+FAIL the patch's function compiles (md_nvrm_boost_burst'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+   64 |     reset(NVKMD_NVRM_BOOST_BURST); nvkmd_nvrm_boost_burst(&P); g_now += 30 * S; nvkmd_nvrm_boost_burst(&P);
+      |                                    ^
+7 errors generated.)
+3 failed
+
+
+FAIL test_nvrmfb_connect_owed.py: exit 1
+ok   with no handler registered, the notification is owed instead of dropped
+ok   registering the connect handler pays an owed notification
+ok   it is paid from the thread call, never by calling the handler inside registerForInterruptType
+ok   a registration with a null handler pays nothing
+ok   a fired notification clears the debt, so it is not fired twice
+ok   the hot-plugged framebuffer still schedules its interrupt only after a successful mode set (unchanged)
+ok   the debt starts at zero on every framebuffer
+FAIL negative control: the owed-interrupt arms fail on the pre-fix source
+1 failed
+
+
+FAIL test_pageoff_hold.py: exit 1
+ok   the unlocked wait is still in pageoff (the check looked at the right function)
+ok   the resource and the accelerator are held before the lock is released, until the function returns
+FAIL control: the earlier source is readable (fatal: invalid object name '406d9824'.)
+ok   the switch stays off by default and only root can turn it on
+FAILED
+
+
+FAIL test_tree_layout.py: exit 1
+ok   the listing is not empty (the check looked at something)
+FAIL every tracked top-level entry is one the project is made of: DEVELOPING.md
+FAIL control: a stray top-level folder is reported
+FAILED: every tracked top-level entry is one the project is made of, control: a stray top-level folder is reported
+
+
+not run test_claims.c: its header names no build line
+not run test_dlss_worker.c: its build line needs a path filled in (see its header)
+not run test_fcwarm.py: needs a built libnvmtl_translate.dylib and a shader file (build step)
+not run test_gl_translation.py: needs a built libnvmtl_translate.dylib (build step)
+not run test_nvdec_vram_copy.c: its header names no build line
+not run test_nvrm_utilization.cpp: its header names no build line
+not run test_nvrmfb_audio_match.cpp: its header names no build line
+not run test_patch_chain.sh: needs a pristine NVIDIA open-gpu-kernel-modules 620.70.06 tree (build_nvrm.sh runs it)
+not run test_primary_gpu_range.cpp: its header names no build line
+not run test_resource_phi_fold.py: needs a built libnvmtl_translate.dylib (build step)
+255 passed, 9 failed, 0 skipped, 10 not run, of 274

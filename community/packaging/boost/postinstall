@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+umask 022
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+[ "$(id -u)" = 0 ] && [ "${3:-/}" = / ]
+here=$(cd "$(dirname "$0")" && pwd -P)
+cd "$here"
+shasum -a 256 --strict --quiet -c - <<'HASHES'
+d8ed06c2922b25b0351edc1ce21a805c3dfc2edc550ceb915d05cd9bdb06eb4a  boost_daemon.sh
+7dd80566a00f945d4b3224564865956a04e26f254fd806eac8fec42853718c07  Library/NullMoth/boost/nvmtl-boost
+HASHES
+# Use the vendor's checked root-owned install paths and configuration.
+unset NULLMOTH_BOOST_ROOT NULLMOTH_BOOST_OWNER_UID NULLMOTH_BOOST_NO_LAUNCHCTL
+/bin/bash "$here/boost_daemon.sh" install "$here"
+/bin/bash "$here/boost_daemon.sh" set on
+/bin/launchctl print system/com.nullmoth.nvmtl-boost >/dev/null
+/bin/bash "$here/boost_daemon.sh" status

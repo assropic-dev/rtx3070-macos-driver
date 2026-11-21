@@ -1,0 +1,9 @@
+Undefined symbols for architecture x86_64:
+  "_nvlog_every", referenced from:
+      _dlss_heap_line in test_dlss_worker-9bd66b.o
+  "_nvmtl_heap_lazy_census", referenced from:
+      _fg_create_impl in test_dlss_worker-9bd66b.o
+  "_nvmtl_heaps_dump", referenced from:
+      _fg_create_impl in test_dlss_worker-9bd66b.o
+ld: symbol(s) not found for architecture x86_64
+clang: error: linker command failed with exit code 1 (use -v to see invocation)

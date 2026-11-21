@@ -1,0 +1,73 @@
+{
+  "package": "RTX3070-Display-3.0.2-Consolidated-local.pkg",
+  "package_sha256": "c222cca0efe23a3df0ce2ffbefde561e7db8f54b5fdb6e22ff382e54da396b91",
+  "components": {
+    "NVAccel-15": "55e770eb8d97977d1b749a668b5ba2d6d5b9b24d3c86538d9b0feb20960b5b52",
+    "NVAccel-26": "d20b33fe71e3a3592dd1d7e70aee15b066b84e05ae32a95d8863ade5b2ce7797",
+    "NVRMFB": "6da394f155441cf1019c7d02d3b2ec51f9e591dc821bac7d79878ef03334a917",
+    "NVMTLDriver": "1b93db73660bb6975f7d9149e77998b4adf8ed77c08d4f5c4f03c4c22a98db80",
+    "NVK": "4e56026f67822a3b75959f061ee209d0f72d5f968eb2c935bf8fa5f96b887e30",
+    "NVRM": "ba6184e9a092687692af1b9e16cff555c7c3f1d81c258c8c8b77273ed7cadf05",
+    "NVRMAGDC": "97623c55c4a804fd5d4a5338d06672fe87f160576435853dc6b6e13505b325b9",
+    "libnvdec_h264.dylib": "6068bacc3ef379c87985d28e4e177bd5b0b28f09c4263c4e786bc4bd3d3f16d0",
+    "libnvdec_h264_t2d.dylib": "fdfd6e9c356bb4eac42d6841d950db3545cb97e6bcb2b039132d190119a52de3",
+    "libnvdec_hevc.dylib": "64b2353a900dc8bb6feb6c4b0037b948bdcb5d568d4573693cc56f3b7ba1e537",
+    "libnvenc_h264.dylib": "fb0cd5308c52072fedfdee0b83350294e8081d8628a6af99cb1230999ba73640",
+    "libnvenc_h264_ga10x.dylib": "92985c5286ddc5c5dfb77ec04ea3364d92524e461abf93fb3646c4fe302488cb",
+    "libnvenc_h264_tu10x.dylib": "5c8beff535e41c50f156272055e5da5a47340796890318b93419c0afb4d25d03",
+    "libnvenc_hevc.dylib": "3d8da379030c0e9927b596b30afa4e0ab911a9070469e4b1a5574679ee1f959a",
+    "libnvenc_hevc_ga10x.dylib": "7dc75f56ecb28678e8b64dcfe3766b2966ac44abd6add07ff9c40c60fd59bbf6",
+    "libnvenc_hevc_tu10x.dylib": "d6f1587eda2bd653857f05379a38ae053fd6fdd40f741e5c7ee31b63243b2f27",
+    "libnvencvt.dylib": "05ccacb225e9e7e454a315f7b03dd0dd8c842d4735c81d19735f5610e21e5b8c",
+    "libnvmtl_translate.dylib": "2fd53e2a3571010b40c6d3fa305a3f1c41705b0afeb17a403677b1e69cf22ee0",
+    "libvulkan.1.4.362.dylib": "dc81d04917bd1aad88b2ec150ff3150f44dd24b786b227874492aae62e7c9c6e",
+    "nvmtl-boost": "7dd80566a00f945d4b3224564865956a04e26f254fd806eac8fec42853718c07"
+  },
+  "manifest_sha256": "ebc2f8189a396b68e3ebfce41e949f81ed44ef5ae3069aad84df59910f2bdebe",
+  "payload_sha256": "fc8897aaf95c0f1b13e859f9115a871c5183f4338b442ef8cee39ef61319b5aa",
+  "choices": {
+    "Default": {
+      "default": -1,
+      "local.rtx3070.display.consolidated": 1,
+      "local.nullmoth.angle-metal-defaults.apply": 0,
+      "local.rtx3070.gpu-boost.enable": 0
+    },
+    "GUI only": {
+      "default": -1,
+      "local.rtx3070.display.consolidated": 1,
+      "local.nullmoth.angle-metal-defaults.apply": 1,
+      "local.rtx3070.gpu-boost.enable": 0
+    },
+    "Boost only": {
+      "default": -1,
+      "local.rtx3070.display.consolidated": 1,
+      "local.nullmoth.angle-metal-defaults.apply": 0,
+      "local.rtx3070.gpu-boost.enable": 1
+    },
+    "Both opt-ins": {
+      "default": 1,
+      "local.rtx3070.display.consolidated": 1,
+      "local.nullmoth.angle-metal-defaults.apply": 1,
+      "local.rtx3070.gpu-boost.enable": 1
+    }
+  },
+  "license_files": {
+    "LICENSE": "1b5c7a92697863d38fd2779af76732acfb8f521b758781eab057ad966701b0b7",
+    "NOTICE": "2b0159df575b43064d7d9680c774bf465e2250c0e4256d852f77bb6efc17653f",
+    "BLAKE3-LICENSE-CC0.txt": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499",
+    "FreeBSD-snd_hda-LICENSE.txt": "c8a230fd94b22021339120de706c7f078e806bf5c1dab121d53596fc9dcf8f58",
+    "Intel-i915-firmware-LICENSE.txt": "8542aeabf2761935122d693561e16766ce1bcc2b0d003204f9040b7d6d929f2e",
+    "Linux-i915-display-LICENSE.txt": "eac21602acaa8ef3fe4e97779b4bacf8191a28bd04fdf601f4b569cecef12313",
+    "Mesa-license.rst": "0d1a0472ecc81830e75c20d59b0ea02841e3db21255e0ebad97ab682c54d6615",
+    "NVIDIA-firmware-LICENCE.txt": "bc5225a57f49c5249dcf238e4ae6437811677a2a8a7f579c3d839e058653ee44",
+    "NVIDIA-open-gpu-kernel-modules-COPYING.txt": "d8e96d29bc323000e7ba56102d77c88226a7a3d0d94e2081cb4b071ae9de4a06",
+    "PrimeBridge-LICENSE.txt": "236cd495b49ab6d93d6129e95045c37aa06c7417073ce413a75410659e815470",
+    "Vulkan-Loader-LICENSE.txt": "43c0a37e6a0fa7ff3c843b3ec5a4fac84b712558ddac103fbd4c1649662a9ece",
+    "WhateverXe-LICENSE.txt": "8f99f6082ccc808df2ece79446108bfd5c0c04da9ba81c5463568ced862a0b05",
+    "mickys-nvenc-LICENSE.txt": "8bc30783c2c29e486daccf38aa5717883fd42fc0596a090ed08a3dbd7f195ca2",
+    "nvk-rust-crates.txt": "344d0d185be8804581b98d3cabd08fb2361498e587120c9f2d2360b064c4af7a",
+    "translator-rust-crates.txt": "cdd37199d7e87fe2519ef84c18df0f65c5daf3aa453e5d2b4692d6d100c04f19",
+    "zstd-LICENSE.txt": "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8"
+  },
+  "installed_during_packaging": false
+}
